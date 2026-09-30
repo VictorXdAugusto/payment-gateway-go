@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -43,7 +44,7 @@ func (r *LedgerRepository) Post(ctx context.Context, t ledger.Transaction) error
 			return fmt.Errorf("inserir transação: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
-			return ledger.ErrDuplicateReference
+			return r.classifyDuplicate(ctx, db, t)
 		}
 
 		// Contas sempre em ordem de ID. Precaução clássica contra deadlock: duas transações
@@ -70,6 +71,59 @@ func (r *LedgerRepository) Post(ctx context.Context, t ledger.Transaction) error
 	return mapLedgerError(err)
 }
 
+// classifyDuplicate decide o que a referência repetida significa: repetição idempotente
+// (mesmo conteúdo financeiro) ou conflito (mesma referência, outro movimento).
+func (r *LedgerRepository) classifyDuplicate(ctx context.Context, db DBTX, t ledger.Transaction) error {
+	var kind, paymentID string
+	if err := db.QueryRow(ctx,
+		`SELECT kind, payment_id FROM ledger_transactions WHERE reference = $1`, t.Reference()).Scan(&kind, &paymentID); err != nil {
+		return fmt.Errorf("carregar transação existente: %w", err)
+	}
+	if kind != string(t.Kind()) || paymentID != t.PaymentID() {
+		return fmt.Errorf("%w: %s gravada como %s do pagamento %s, nova chamada é %s do pagamento %s",
+			ledger.ErrReferenceConflict, t.Reference(), kind, paymentID, t.Kind(), t.PaymentID())
+	}
+
+	rows, err := db.Query(ctx, `
+		SELECT e.account_id, e.direction, e.amount, e.currency
+		  FROM ledger_entries e
+		  JOIN ledger_transactions t ON t.id = e.transaction_id
+		 WHERE t.reference = $1`, t.Reference())
+	if err != nil {
+		return fmt.Errorf("carregar lançamentos existentes: %w", err)
+	}
+	defer rows.Close()
+	var stored []string
+	for rows.Next() {
+		var acc, dir, cur string
+		var amount int64
+		if err := rows.Scan(&acc, &dir, &amount, &cur); err != nil {
+			return err
+		}
+		stored = append(stored, legKey(acc, dir, amount, cur))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	var incoming []string
+	for _, e := range t.Entries() {
+		incoming = append(incoming, legKey(string(e.Account.ID), string(e.Direction), e.Amount.Amount(), string(e.Amount.Currency())))
+	}
+	sort.Strings(stored)
+	sort.Strings(incoming)
+	if !slices.Equal(stored, incoming) {
+		return fmt.Errorf("%w: %s já gravada com lançamentos %v, nova chamada tem %v",
+			ledger.ErrReferenceConflict, t.Reference(), stored, incoming)
+	}
+	return ledger.ErrDuplicateReference
+}
+
+// legKey é a forma canônica de uma perna (conta, direção, valor, moeda) para comparação.
+func legKey(account, direction string, amount int64, currency string) string {
+	return fmt.Sprintf("%s|%s|%d|%s", account, direction, amount, currency)
+}
+
 func sortedAccounts(entries []ledger.Entry) []ledger.Account {
 	seen := make(map[ledger.AccountID]ledger.Account, len(entries))
 	for _, e := range entries {
@@ -89,7 +143,7 @@ func (r *LedgerRepository) ensureAccount(ctx context.Context, db DBTX, a ledger.
 	if a.MerchantID != "" {
 		merchantID = a.MerchantID
 	}
-	_, err := db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		INSERT INTO ledger_accounts (id, type, currency, merchant_id)
 		VALUES ($1, $2, $3, $4::uuid)
 		ON CONFLICT (id) DO NOTHING`,
@@ -97,23 +151,40 @@ func (r *LedgerRepository) ensureAccount(ctx context.Context, db DBTX, a ledger.
 	if err != nil {
 		return fmt.Errorf("garantir conta %s: %w", a.ID, err)
 	}
+	if tag.RowsAffected() > 0 {
+		return nil // conta criada agora, nada a conferir
+	}
+
+	// A conta já existia: só serve se for a mesma (tipo, moeda e dono).
+	var same bool
+	if err := db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM ledger_accounts
+			 WHERE id = $1 AND type = $2 AND currency = $3
+			   AND merchant_id IS NOT DISTINCT FROM $4::uuid)`,
+		string(a.ID), string(a.Type), string(a.Currency), merchantID).Scan(&same); err != nil {
+		return fmt.Errorf("conferir conta %s: %w", a.ID, err)
+	}
+	if !same {
+		return fmt.Errorf("%w: conta %s", ledger.ErrAccountMismatch, a.ID)
+	}
 	return nil
 }
 
 func (r *LedgerRepository) Balance(ctx context.Context, id ledger.AccountID) (ledger.Balance, error) {
 	var (
 		acc            = ledger.Account{ID: id}
-		typ, cur       string
+		typ, cur, mid  string
 		debits, credit int64
 	)
 	err := r.tx.DB(ctx).QueryRow(ctx, `
-		SELECT a.type, a.currency,
+		SELECT a.type, a.currency, COALESCE(a.merchant_id::text, ''),
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'debit'),  0)::bigint,
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'credit'), 0)::bigint
 		  FROM ledger_accounts a
 		  LEFT JOIN ledger_entries e ON e.account_id = a.id
 		 WHERE a.id = $1
-		 GROUP BY a.id`, string(id)).Scan(&typ, &cur, &debits, &credit)
+		 GROUP BY a.id`, string(id)).Scan(&typ, &cur, &mid, &debits, &credit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Balance{}, ledger.ErrAccountNotFound
 	}
@@ -121,7 +192,7 @@ func (r *LedgerRepository) Balance(ctx context.Context, id ledger.AccountID) (le
 		return ledger.Balance{}, fmt.Errorf("saldo de %s: %w", id, err)
 	}
 
-	acc.Type, acc.Currency = ledger.AccountType(typ), money.Currency(cur)
+	acc.Type, acc.Currency, acc.MerchantID = ledger.AccountType(typ), money.Currency(cur), mid
 	d, err := money.New(debits, acc.Currency)
 	if err != nil {
 		return ledger.Balance{}, err

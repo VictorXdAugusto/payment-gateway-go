@@ -357,3 +357,68 @@ func TestPost_ConcurrentDuplicates_PostExactlyOnce(t *testing.T) {
 		t.Errorf("psp_clearing = %d: cobrou mais de uma vez", got)
 	}
 }
+
+// Mesma referência com valor diferente não é retry: só o primeiro movimento foi contabilizado.
+func TestPost_SameReferenceDifferentContent_IsConflict(t *testing.T) {
+	e := setup(t)
+	if err := e.repo.Post(e.ctx, e.refund(t, "r1", "pay_1", 1000)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := e.repo.Post(e.ctx, e.refund(t, "r1", "pay_1", 5000))
+	if !errors.Is(err, ledger.ErrReferenceConflict) || errors.Is(err, ledger.ErrDuplicateReference) {
+		t.Fatalf("valor diferente: err = %v, want ErrReferenceConflict", err)
+	}
+	err = e.repo.Post(e.ctx, e.refund(t, "r1", "pay_outro", 1000))
+	if !errors.Is(err, ledger.ErrReferenceConflict) {
+		t.Fatalf("pagamento diferente: err = %v, want ErrReferenceConflict", err)
+	}
+	// O idêntico continua sendo repetição legítima.
+	err = e.repo.Post(e.ctx, e.refund(t, "r1", "pay_1", 1000))
+	if !errors.Is(err, ledger.ErrDuplicateReference) {
+		t.Fatalf("idêntico: err = %v, want ErrDuplicateReference", err)
+	}
+	if e.count(t, "ledger_transactions") != 1 || e.count(t, "ledger_entries") != 2 {
+		t.Error("o conflito deixou lixo no banco")
+	}
+}
+
+func TestPost_ExistingAccountWithDifferentOwner_IsMismatch(t *testing.T) {
+	e := setup(t)
+	other := pgtest.Merchant(e.ctx, t, e.pool, "outra")
+	acc := ledger.MerchantBalance(e.merchant, money.BRL)
+	if _, err := e.pool.Exec(e.ctx,
+		`INSERT INTO ledger_accounts (id, type, currency, merchant_id) VALUES ($1, 'liability', 'BRL', $2::uuid)`,
+		string(acc.ID), other); err != nil {
+		t.Fatal(err)
+	}
+
+	err := e.repo.Post(e.ctx, e.capture(t, "pay_1", 10000, 290))
+	if !errors.Is(err, ledger.ErrAccountMismatch) {
+		t.Fatalf("err = %v, want ErrAccountMismatch", err)
+	}
+	if e.count(t, "ledger_transactions") != 0 {
+		t.Error("a transação sobreviveu ao erro")
+	}
+}
+
+func TestBalance_FillsMerchantID(t *testing.T) {
+	e := setup(t)
+	if err := e.repo.Post(e.ctx, e.capture(t, "pay_1", 10000, 290)); err != nil {
+		t.Fatal(err)
+	}
+	b, err := e.repo.Balance(e.ctx, ledger.MerchantBalance(e.merchant, money.BRL).ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Account.MerchantID != e.merchant {
+		t.Errorf("MerchantID = %q, want %q", b.Account.MerchantID, e.merchant)
+	}
+	p, err := e.repo.Balance(e.ctx, ledger.PSPClearing(money.BRL).ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account.MerchantID != "" {
+		t.Errorf("conta do gateway com MerchantID = %q", p.Account.MerchantID)
+	}
+}

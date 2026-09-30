@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/money"
@@ -32,6 +33,9 @@ func BalanceOf(account Account, entries []Entry) (Balance, error) {
 		if e.Account.ID != account.ID {
 			continue
 		}
+		if !e.Direction.IsValid() {
+			return Balance{}, fmt.Errorf("%w: direção %q", ErrInvalidTransaction, e.Direction)
+		}
 		if e.Direction == Debit {
 			b.Debits, err = b.Debits.Add(e.Amount)
 		} else {
@@ -57,8 +61,12 @@ type StatementLine struct {
 
 // Repository é a porta de persistência do ledger; a implementação vive em infrastructure.
 type Repository interface {
-	// Post grava a transação inteira ou nada. Devolve ErrDuplicateReference se o
-	// movimento já tinha sido lançado (o chamador trata isso como sucesso idempotente).
+	// Post grava a transação inteira ou nada. Se a referência já existe, compara o conteúdo
+	// financeiro (tipo, pagamento e pernas) com o que foi gravado:
+	//   - idêntico: devolve ErrDuplicateReference (repetição legítima, o chamador trata
+	//     como sucesso idempotente);
+	//   - diferente: devolve ErrReferenceConflict (a mesma referência com outro valor não
+	//     pode ser tratada como sucesso, pois só o movimento original foi contabilizado).
 	Post(ctx context.Context, tx Transaction) error
 
 	// Balance devolve o saldo derivado da conta, ou ErrAccountNotFound.

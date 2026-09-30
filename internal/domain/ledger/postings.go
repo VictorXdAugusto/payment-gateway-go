@@ -19,6 +19,9 @@ const maxBasisPoints = 10000 // 100%
 // feeBasisPoints: 290 = 2,90%. O arredondamento da taxa usa Allocate, então
 // líquido + taxa é SEMPRE o valor cheio, e o centavo que sobra fica com o gateway.
 func Capture(id TransactionID, paymentID, merchantID string, amount money.Money, feeBasisPoints int64, now time.Time) (Transaction, error) {
+	if merchantID == "" {
+		return Transaction{}, fmt.Errorf("%w: merchant_id ausente", ErrInvalidTransaction)
+	}
 	if !amount.IsPositive() {
 		return Transaction{}, fmt.Errorf("%w: captura de %s", ErrInvalidTransaction, amount)
 	}
@@ -47,6 +50,9 @@ func Capture(id TransactionID, paymentID, merchantID string, amount money.Money,
 //
 // refundID identifica ESTE estorno (um pagamento pode ter vários).
 func Refund(id TransactionID, refundID, paymentID, merchantID string, amount money.Money, now time.Time) (Transaction, error) {
+	if merchantID == "" {
+		return Transaction{}, fmt.Errorf("%w: merchant_id ausente", ErrInvalidTransaction)
+	}
 	if refundID == "" {
 		return Transaction{}, fmt.Errorf("%w: refund_id ausente", ErrInvalidTransaction)
 	}

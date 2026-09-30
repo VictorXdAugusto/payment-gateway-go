@@ -240,3 +240,20 @@ func TestCapture_AlwaysBalanced_Property(t *testing.T) {
 		}
 	}
 }
+
+func TestCapture_And_Refund_RejectEmptyMerchant(t *testing.T) {
+	if _, err := ledger.Capture("t", "p", "", brl(t, 1000), 290, now); !errors.Is(err, ledger.ErrInvalidTransaction) {
+		t.Errorf("capture sem lojista: %v", err)
+	}
+	if _, err := ledger.Refund("t", "r1", "p", "", brl(t, 1000), now); !errors.Is(err, ledger.ErrInvalidTransaction) {
+		t.Errorf("refund sem lojista: %v", err)
+	}
+}
+
+func TestBalanceOf_RejectsInvalidDirection(t *testing.T) {
+	psp := ledger.PSPClearing(money.BRL)
+	entries := []ledger.Entry{{Account: psp, Direction: "deibt", Amount: brl(t, 100)}}
+	if _, err := ledger.BalanceOf(psp, entries); !errors.Is(err, ledger.ErrInvalidTransaction) {
+		t.Fatalf("err = %v, want ErrInvalidTransaction", err)
+	}
+}
