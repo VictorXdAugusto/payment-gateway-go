@@ -65,6 +65,12 @@ func Load() (Config, error) {
 	if cfg.PSPMaxAttempts, err = envInt("PSP_MAX_ATTEMPTS", 3, 1, 10); err != nil {
 		return Config{}, err
 	}
+	// Se o lease da chave for menor que o pior caso de uma requisição, outra requisição com a
+	// mesma chave assume o processamento enquanto a primeira ainda está no PSP.
+	if worst := pspWorstCase(cfg.PSPMaxAttempts, cfg.PSPAttemptTimeout, cfg.PSPBaseBackoff, cfg.PSPMaxBackoff); cfg.IdempotencyLease <= worst {
+		return Config{}, fmt.Errorf("IDEMPOTENCY_LEASE (%s) deve ser maior que o pior caso de uma chamada ao PSP (%s)",
+			cfg.IdempotencyLease, worst)
+	}
 	fee, err := envInt("PLATFORM_FEE_BPS", 290, 0, 10000)
 	if err != nil {
 		return Config{}, err
@@ -82,6 +88,20 @@ func Load() (Config, error) {
 	cfg.LogLevel = level
 
 	return cfg, nil
+}
+
+// pspWorstCase é o tempo máximo de UMA chamada ao PSP: todas as tentativas estourando o
+// timeout, mais todos os backoffs no teto (espelha o backoff exponencial do cliente).
+func pspWorstCase(attempts int, timeout, base, max time.Duration) time.Duration {
+	total := time.Duration(attempts) * timeout
+	for i := 1; i < attempts; i++ {
+		wait := base << (i - 1)
+		if max > 0 && (wait > max || wait <= 0) {
+			wait = max
+		}
+		total += wait
+	}
+	return total
 }
 
 func envDuration(key, fallback string) (time.Duration, error) {
@@ -150,7 +170,10 @@ type WorkerConfig struct {
 	ReconcileInterval   time.Duration
 	ReconcileStaleAfter time.Duration
 	ReconcilePageSize   int
-	ReconcileMaxErrors  int
+	// IdempotencyLease: o MESMO IDEMPOTENCY_LEASE do servidor. O reconciliador pula pagamentos cuja
+	// chave está travada dentro dele (requisição viva).
+	IdempotencyLease   time.Duration
+	ReconcileMaxErrors int
 
 	// Retenção: quanto tempo guardar o que já não serve para operar.
 	RetentionInterval    time.Duration
@@ -216,6 +239,9 @@ func LoadWorker() (WorkerConfig, error) {
 	if c.ReconcileStaleAfter, err = envDuration("RECONCILE_STALE_AFTER", "1m"); err != nil {
 		return WorkerConfig{}, err
 	}
+	if c.IdempotencyLease, err = envDuration("IDEMPOTENCY_LEASE", "30s"); err != nil {
+		return WorkerConfig{}, err
+	}
 	if c.ReconcilePageSize, err = envInt("RECONCILE_PAGE_SIZE", 100, 1, 1000); err != nil {
 		return WorkerConfig{}, err
 	}
@@ -235,11 +261,19 @@ func LoadWorker() (WorkerConfig, error) {
 		return WorkerConfig{}, err
 	}
 
-	// Uma requisição viva pode demorar até tentativas x timeout no PSP. Reconciliar antes disso
-	// atropelaria uma requisição que ainda vai gravar o próprio desfecho.
-	if worst := time.Duration(c.PSPMaxAttempts) * c.PSPAttemptTimeout; c.ReconcileStaleAfter <= worst {
-		return WorkerConfig{}, fmt.Errorf("RECONCILE_STALE_AFTER (%s) deve ser maior que PSP_MAX_ATTEMPTS x PSP_ATTEMPT_TIMEOUT (%s)",
+	// Uma requisição viva pode demorar o pior caso do PSP (tentativas x timeout + backoffs).
+	// Reconciliar antes disso atropelaria uma requisição que ainda vai gravar o próprio desfecho.
+	if worst := pspWorstCase(c.PSPMaxAttempts, c.PSPAttemptTimeout, c.PSPBaseBackoff, c.PSPMaxBackoff); c.ReconcileStaleAfter <= worst {
+		return WorkerConfig{}, fmt.Errorf("RECONCILE_STALE_AFTER (%s) deve ser maior que o pior caso de uma chamada ao PSP (%s)",
 			c.ReconcileStaleAfter, worst)
+	}
+	// O lease de uma entrega começa quando o LOTE é reivindicado, mas as entregas excedentes
+	// esperam vaga na concorrência. Se o lease vencer antes de a última começar, outro worker a
+	// reassume e o lojista recebe o mesmo evento em paralelo.
+	rounds := (c.BatchSize + c.Concurrency - 1) / c.Concurrency
+	if need := time.Duration(rounds) * c.DeliveryTimeout; c.Lease <= need {
+		return WorkerConfig{}, fmt.Errorf("WEBHOOK_LEASE (%s) deve ser maior que %d rodada(s) de entrega x WEBHOOK_TIMEOUT (%s)",
+			c.Lease, rounds, need)
 	}
 
 	// Se o lease fosse menor que o timeout, outro worker reassumiria uma entrega AINDA em curso.

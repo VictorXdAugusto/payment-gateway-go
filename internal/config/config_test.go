@@ -60,3 +60,52 @@ func TestLoadWorker_RejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestPSPWorstCaseIncludesBackoffs(t *testing.T) {
+	// 3 tentativas de 2s + backoffs 1s e 2s (teto 10s) = 6s + 3s = 9s.
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("PSP_MAX_ATTEMPTS", "3")
+	t.Setenv("PSP_ATTEMPT_TIMEOUT", "2s")
+	t.Setenv("PSP_BASE_BACKOFF", "1s")
+	t.Setenv("PSP_MAX_BACKOFF", "10s")
+	t.Setenv("IDEMPOTENCY_LEASE", "9s") // exatamente o pior caso: não cobre
+	if _, err := config.Load(); err == nil || !strings.Contains(err.Error(), "IDEMPOTENCY_LEASE") {
+		t.Fatalf("err = %v, want erro de IDEMPOTENCY_LEASE", err)
+	}
+	t.Setenv("IDEMPOTENCY_LEASE", "10s")
+	if _, err := config.Load(); err != nil {
+		t.Fatalf("lease acima do pior caso deve valer: %v", err)
+	}
+}
+
+// O corte de reconciliação precisa cobrir também as esperas de backoff, não só os timeouts.
+func TestLoadWorker_StaleAfterMustCoverBackoffsToo(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("PSP_MAX_ATTEMPTS", "3")
+	t.Setenv("PSP_ATTEMPT_TIMEOUT", "2s") // 6s de timeouts
+	t.Setenv("PSP_BASE_BACKOFF", "10s")
+	t.Setenv("PSP_MAX_BACKOFF", "10s") // + 20s de backoffs = 26s
+	t.Setenv("RECONCILE_STALE_AFTER", "7s")
+	if _, err := config.LoadWorker(); err == nil {
+		t.Fatal("7s não cobre 26s de pior caso")
+	}
+	t.Setenv("RECONCILE_STALE_AFTER", "27s")
+	if _, err := config.LoadWorker(); err != nil {
+		t.Fatalf("27s cobre: %v", err)
+	}
+}
+
+func TestLoadWorker_LeaseMustCoverAllDeliveryRounds(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_BATCH", "100")
+	t.Setenv("WEBHOOK_CONCURRENCY", "1") // 100 rodadas
+	t.Setenv("WEBHOOK_TIMEOUT", "2s")    // 200s no pior caso
+	t.Setenv("WEBHOOK_LEASE", "60s")
+	if _, err := config.LoadWorker(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_LEASE") {
+		t.Fatalf("err = %v", err)
+	}
+	t.Setenv("WEBHOOK_CONCURRENCY", "100") // 1 rodada
+	if _, err := config.LoadWorker(); err != nil {
+		t.Fatalf("1 rodada cabe no lease: %v", err)
+	}
+}
