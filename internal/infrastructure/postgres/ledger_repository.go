@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -130,6 +131,84 @@ func (r *LedgerRepository) Balance(ctx context.Context, id ledger.AccountID) (le
 		return ledger.Balance{}, err
 	}
 	return ledger.Balance{Account: acc, Debits: d, Credits: c}, nil
+}
+
+// MerchantBalances soma os lançamentos das contas do lojista, uma linha por moeda.
+func (r *LedgerRepository) MerchantBalances(ctx context.Context, merchantID string) ([]ledger.Balance, error) {
+	rows, err := r.tx.DB(ctx).Query(ctx, `
+		SELECT a.id, a.currency,
+		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'debit'),  0)::bigint,
+		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'credit'), 0)::bigint
+		  FROM ledger_accounts a
+		  LEFT JOIN ledger_entries e ON e.account_id = a.id
+		 WHERE a.merchant_id = $1::uuid
+		 GROUP BY a.id, a.currency
+		 ORDER BY a.currency`, merchantID)
+	if err != nil {
+		return nil, fmt.Errorf("saldos do lojista: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ledger.Balance
+	for rows.Next() {
+		var (
+			id, cur        string
+			debits, credit int64
+		)
+		if err := rows.Scan(&id, &cur, &debits, &credit); err != nil {
+			return nil, err
+		}
+		acc := ledger.MerchantBalance(merchantID, money.Currency(cur))
+		d, err := money.New(debits, acc.Currency)
+		if err != nil {
+			return nil, err
+		}
+		c, err := money.New(credit, acc.Currency)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ledger.Balance{Account: acc, Debits: d, Credits: c})
+	}
+	return out, rows.Err()
+}
+
+// MerchantStatement pagina por cursor (id do lançamento), sempre do mais novo para o mais antigo.
+// O índice (account_id, id DESC) atende a consulta sem ordenar.
+func (r *LedgerRepository) MerchantStatement(ctx context.Context, merchantID string, before int64, limit int) ([]ledger.StatementLine, error) {
+	rows, err := r.tx.DB(ctx).Query(ctx, `
+		SELECT e.id, e.transaction_id, t.kind, t.payment_id, e.direction, e.amount, e.currency, t.created_at
+		  FROM ledger_entries e
+		  JOIN ledger_transactions t ON t.id = e.transaction_id
+		 WHERE e.account_id IN (SELECT id FROM ledger_accounts WHERE merchant_id = $1::uuid)
+		   AND ($2::bigint = 0 OR e.id < $2)
+		 ORDER BY e.id DESC
+		 LIMIT $3`, merchantID, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("extrato do lojista: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ledger.StatementLine
+	for rows.Next() {
+		var (
+			l               ledger.StatementLine
+			kind, dir, cur  string
+			amount          int64
+			created         time.Time
+			txID, paymentID string
+		)
+		if err := rows.Scan(&l.EntryID, &txID, &kind, &paymentID, &dir, &amount, &cur, &created); err != nil {
+			return nil, err
+		}
+		m, err := money.New(amount, money.Currency(cur))
+		if err != nil {
+			return nil, err
+		}
+		l.TransactionID, l.Kind, l.PaymentID = ledger.TransactionID(txID), ledger.Kind(kind), paymentID
+		l.Direction, l.Amount, l.CreatedAt = ledger.Direction(dir), m, created.UTC()
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // mapLedgerError traduz a violação do trigger de balanço para o erro de domínio.

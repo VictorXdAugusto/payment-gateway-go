@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"time"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/money"
 )
@@ -43,6 +44,17 @@ func BalanceOf(account Account, entries []Entry) (Balance, error) {
 	return b, nil
 }
 
+// StatementLine é um lançamento na conta do lojista, como aparece no extrato.
+type StatementLine struct {
+	EntryID       int64 // cresce com o tempo: serve de cursor de paginação
+	TransactionID TransactionID
+	Kind          Kind
+	PaymentID     string
+	Direction     Direction
+	Amount        money.Money
+	CreatedAt     time.Time
+}
+
 // Repository é a porta de persistência do ledger; a implementação vive em infrastructure.
 type Repository interface {
 	// Post grava a transação inteira ou nada. Devolve ErrDuplicateReference se o
@@ -51,4 +63,11 @@ type Repository interface {
 
 	// Balance devolve o saldo derivado da conta, ou ErrAccountNotFound.
 	Balance(ctx context.Context, id AccountID) (Balance, error)
+
+	// MerchantBalances devolve o saldo do lojista em cada moeda que ele já movimentou.
+	MerchantBalances(ctx context.Context, merchantID string) ([]Balance, error)
+
+	// MerchantStatement devolve os lançamentos do lojista, do mais novo para o mais antigo,
+	// só os de EntryID menor que before (0 = desde o início), no máximo limit.
+	MerchantStatement(ctx context.Context, merchantID string, before int64, limit int) ([]StatementLine, error)
 }
