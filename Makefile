@@ -1,6 +1,6 @@
 COMPOSE ?= docker-compose
 
-.PHONY: up down logs test vet run migrate-down
+.PHONY: up down logs test test-integration vet run migrate-down
 
 up: ## Sobe tudo (banco, migrations, app)
 	$(COMPOSE) up -d --build
@@ -13,6 +13,11 @@ logs:
 
 test:
 	go test -race -count=1 ./...
+
+test-integration: ## Testes contra Postgres real (cada teste cria e descarta um banco)
+	$(COMPOSE) up -d postgres
+	TEST_DATABASE_URL="postgres://$$(grep POSTGRES_USER .env | cut -d= -f2):$$(grep POSTGRES_PASSWORD .env | cut -d= -f2)@localhost:$$(grep POSTGRES_HOST_PORT .env | cut -d= -f2)/$$(grep POSTGRES_DB .env | cut -d= -f2)?sslmode=disable" \
+		go test -race -count=1 ./...
 
 vet:
 	go vet ./...
