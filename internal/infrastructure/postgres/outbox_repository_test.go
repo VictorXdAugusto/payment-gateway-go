@@ -282,3 +282,44 @@ func TestOutbox_Claim_ConcurrentWorkersGetDisjointBatches(t *testing.T) {
 		}
 	}
 }
+
+// O que SKIP LOCKED realmente compra: não esperar. Sem ele o resultado continua correto (o
+// Postgres reavalia o WHERE), mas o worker BLOQUEIA atrás de quem segura as linhas e o lote
+// volta incompleto. Lacuna achada por mutação: o teste de concorrência acima não percebia.
+func TestOutbox_Claim_PassesStraightThroughRowsLockedByAnotherTransaction(t *testing.T) {
+	e := setup(t)
+	e.addEvents(t, "evt_1", "evt_2", "evt_3", "evt_4", "evt_5", "evt_6")
+
+	// Outra transação (outro worker no meio do claim) segura as 3 primeiras linhas.
+	holder, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(e.ctx)
+	if _, err := holder.Exec(e.ctx, `SELECT id FROM outbox_events WHERE event_id IN ('evt_1','evt_2','evt_3') FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(e.ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	got, err := e.outbox().Claim(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatalf("Claim bloqueou atrás das linhas travadas (%v): falta SKIP LOCKED", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("Claim levou %v: esperou o lock em vez de pular", took)
+	}
+	if want := []string{"evt_4", "evt_5", "evt_6"}; len(got) != 3 || ids(got)[0] != want[0] || ids(got)[2] != want[2] {
+		t.Fatalf("claimed = %v, want %v (o lote tem que vir CHEIO, sem as travadas)", ids(got), want)
+	}
+
+	// Liberadas as travadas, elas voltam a ser reivindicáveis.
+	if err := holder.Rollback(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := e.outbox().Claim(e.ctx, 10, time.Minute)
+	if err != nil || len(rest) != 3 {
+		t.Fatalf("rest=%v err=%v", ids(rest), err)
+	}
+}
