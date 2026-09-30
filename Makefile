@@ -1,6 +1,6 @@
 COMPOSE ?= docker-compose
 
-.PHONY: up down logs test test-integration vet run migrate-down merchant psp-help webhook webhook-events webhook-replay
+.PHONY: up down logs test test-integration vet run migrate-down merchant psp-help webhook webhook-events webhook-replay loadtest
 
 up: ## Sobe tudo (banco, migrations, app)
 	$(COMPOSE) up -d --build
@@ -55,3 +55,7 @@ webhook-replay: ## Reenvia um evento (por exemplo, um dead): make webhook-replay
 	@test -n "$(EVENT)" || (echo "uso: make webhook-replay EVENT=<event_id>" >&2; exit 1)
 	@echo "UPDATE outbox_events SET status = 'pending', attempts = 0, next_attempt_at = now(), locked_until = NULL, last_error = '' WHERE event_id = :'e' AND status IN ('dead','skipped');" \
 	  | $(COMPOSE) exec -T postgres psql -q -U $$(grep POSTGRES_USER .env | cut -d= -f2) -d $$(grep POSTGRES_DB .env | cut -d= -f2) -v e="$(EVENT)"
+
+loadtest: ## Estresse com verificação de invariantes (app no ar): make loadtest API_KEY=<api key>
+	@test -n "$(API_KEY)" || (echo "uso: make loadtest API_KEY=<api key> (make merchant NAME=carga cria um lojista)" >&2; exit 1)
+	go run ./cmd/loadtest -url http://localhost:$$(grep APP_HOST_PORT .env | cut -d= -f2) -api-key "$(API_KEY)"
