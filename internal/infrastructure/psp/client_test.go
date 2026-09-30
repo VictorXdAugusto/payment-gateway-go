@@ -440,3 +440,27 @@ func TestSimulator_Refund(t *testing.T) {
 	})
 	_ = sim
 }
+
+// Um redirect não pode transformar o POST de captura num GET "bem-sucedido": o cliente não
+// segue redirecionamentos e o 3xx vira erro, sem nunca declarar a captura feita.
+func TestClient_DoesNotFollowRedirects(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	c := infra.New(fastCfg(redirector.URL))
+	err := c.Capture(context.Background(), domain.CaptureRequest{IdempotencyKey: "k", Reference: "auth_1", Amount: brl(t, 100)})
+	if err == nil {
+		t.Fatal("captura 'bem-sucedida' por causa de um redirect")
+	}
+	if targetHits.Load() != 0 {
+		t.Errorf("o destino do redirect foi chamado %d vezes", targetHits.Load())
+	}
+}

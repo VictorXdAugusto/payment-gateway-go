@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/outbox"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/worker"
 )
 
@@ -167,5 +168,40 @@ func TestHousekeeper_Hook_IsNotCalledWhenNothingWasDeleted(t *testing.T) {
 		worker.HousekeeperConfig{Batch: 10, OnPurged: func(string, int64) { calls++ }}, quiet()).RunOnce(context.Background())
 	if calls != 0 {
 		t.Errorf("OnPurged chamado %d vezes sem nada apagado", calls)
+	}
+}
+
+// stuckRepo simula um banco que trava ao gravar o resultado: MarkDelivered só volta quando o
+// contexto expira.
+type stuckRepo struct {
+	outbox.Repository
+}
+
+func (s stuckRepo) MarkDelivered(ctx context.Context, _ outbox.Delivery) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type okSender struct{}
+
+func (okSender) Deliver(context.Context, outbox.Delivery) error { return nil }
+
+// Gravar o resultado tem prazo (o lease): sem ele, um banco travado seguraria o desligamento do
+// worker para sempre, já que o contexto da entrega não herda o cancelamento do desligamento.
+func TestDispatcher_ResultPersistenceIsBoundedByTheLease(t *testing.T) {
+	e := setup(t)
+	e.webhook(t, "https://loja.example/hook")
+	e.add(t, 1)
+	c := cfg()
+	c.Lease = 150 * time.Millisecond
+
+	d := worker.NewDispatcher(stuckRepo{Repository: e.repo}, okSender{}, c, quiet())
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = d.RunOnce(e.ctx) }()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunOnce não terminou: a gravação do resultado ficou sem prazo")
 	}
 }

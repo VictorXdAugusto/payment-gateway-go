@@ -85,7 +85,12 @@ func (d *Dispatcher) RunOnce(ctx context.Context) (int, error) {
 		wg.Add(1)
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			d.process(work, delivery)
+			// O lease é o limite natural de UMA entrega inteira (HTTP + gravar o resultado): passado
+			// o lease outro worker pode reassumir e o resultado seria descartado de qualquer jeito.
+			// Sem prazo, um banco que trava seguraria o desligamento para sempre.
+			ctx, cancel := context.WithTimeout(work, d.cfg.Lease)
+			defer cancel()
+			d.process(ctx, delivery)
 		}()
 	}
 	wg.Wait()

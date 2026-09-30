@@ -40,8 +40,10 @@ func New(cfg Config) *Client {
 		cfg.MaxAttempts = 1
 	}
 	return &Client{
-		cfg:    cfg,
-		http:   &http.Client{}, // o timeout é por tentativa, via context
+		cfg: cfg,
+		// O timeout é por tentativa, via context. Redirect NUNCA é seguido: um 302 transformaria o
+		// POST de captura num GET que "funciona" sem capturar nada (e o 3xx sobe como erro).
+		http:   &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		sleep:  sleep,
 		jitter: fullJitter,
 	}

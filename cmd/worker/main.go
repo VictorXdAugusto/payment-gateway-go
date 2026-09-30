@@ -69,7 +69,7 @@ func run() error {
 		cfg.UnknownGrace, time.Now)
 
 	reconciler := worker.NewReconciler(payments, resolve, worker.ReconcilerConfig{
-		Interval: cfg.ReconcileInterval, StaleAfter: cfg.ReconcileStaleAfter,
+		Interval: cfg.ReconcileInterval, StaleAfter: cfg.ReconcileStaleAfter, IdempotencyLease: cfg.IdempotencyLease,
 		PageSize: cfg.ReconcilePageSize, MaxConsecutiveErrors: cfg.ReconcileMaxErrors,
 		OnResult: metrics.ReconcileResult, OnSweep: metrics.ReconcileSweep,
 	}, log, time.Now)
@@ -96,12 +96,18 @@ func run() error {
 
 	// Três laços independentes no mesmo processo. Todos param quando ctx é cancelado, e o
 	// processo só sai depois de os três terminarem (as entregas em voo são concluídas).
+	// Se o dispatcher terminar por conta própria (não só por sinal), os outros laços são
+	// cancelados junto: um worker pela metade, "saudável" no /ready mas sem entregar nada,
+	// é pior que um worker que cai e é reiniciado pelo orquestrador.
+	loopsCtx, stopLoops := context.WithCancel(ctx)
+	defer stopLoops()
 	var wg sync.WaitGroup
-	for _, loop := range []func(){func() { reconciler.Run(ctx) }, func() { housekeeper.Run(ctx) }} {
+	for _, loop := range []func(){func() { reconciler.Run(loopsCtx) }, func() { housekeeper.Run(loopsCtx) }} {
 		wg.Add(1)
 		go func() { defer wg.Done(); loop() }()
 	}
 	err = dispatcher.Run(ctx)
+	stopLoops()
 	wg.Wait()
 	log.Info("worker encerrado")
 	return err
