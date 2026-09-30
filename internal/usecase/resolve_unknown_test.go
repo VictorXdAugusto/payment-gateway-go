@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
 )
 
@@ -195,7 +196,7 @@ func TestResolveUnknown_LosingTheOptimisticLockRace_ReturnsTheWinnersOutcome(t *
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 
-	resolver := usecase.NewResolveUnknown(newBarrierRepo(e.payments, 2), e.psp, testGrace,
+	resolver := usecase.NewResolveUnknown(postgres.NewTxManager(e.pool), newBarrierRepo(e.payments, 2), e.psp, e.events(), testGrace,
 		func() time.Time { return time.Unix(0, e.clock.Load()).UTC() })
 
 	var wg sync.WaitGroup

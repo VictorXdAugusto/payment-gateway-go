@@ -48,13 +48,14 @@ type CreatePayment struct {
 	payments payment.Repository
 	keys     idempotency.Store
 	gateway  psp.Gateway
+	events   *EventRecorder
 	newID    func() payment.ID
 	now      func() time.Time
 }
 
 func NewCreatePayment(tx TxRunner, payments payment.Repository, keys idempotency.Store, gateway psp.Gateway,
-	newID func() payment.ID, now func() time.Time) *CreatePayment {
-	return &CreatePayment{tx: tx, payments: payments, keys: keys, gateway: gateway, newID: newID, now: now}
+	events *EventRecorder, newID func() payment.ID, now func() time.Time) *CreatePayment {
+	return &CreatePayment{tx: tx, payments: payments, keys: keys, gateway: gateway, events: events, newID: newID, now: now}
 }
 
 // Execute cria um pagamento no máximo UMA vez por (lojista, chave), aconteça o que acontecer:
@@ -111,10 +112,12 @@ func (uc *CreatePayment) run(ctx context.Context, acq idempotency.Acquisition, i
 		if err != nil {
 			return PaymentView{}, err
 		}
-		// Os eventos de domínio (payment.created) viram linhas da outbox no passo 6,
-		// nesta mesma transação. Por ora ficam no agregado.
 		err = uc.tx.WithinTx(ctx, func(ctx context.Context) error {
 			if err := uc.payments.Insert(ctx, p, in.IdempotencyKey); err != nil {
+				return err
+			}
+			// O evento payment.created entra na outbox NA MESMA transação do INSERT.
+			if err := uc.events.Record(ctx, p); err != nil {
 				return err
 			}
 			return uc.keys.Advance(ctx, acq, pointPaymentCreated, string(p.ID()))
@@ -194,6 +197,9 @@ func (uc *CreatePayment) authorize(ctx context.Context, acq idempotency.Acquisit
 	return uc.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if changed { // se o pagamento já tinha saído de created, só falta avançar o ponto
 			if err := uc.payments.Update(ctx, p); err != nil {
+				return err
+			}
+			if err := uc.events.Record(ctx, p); err != nil { // payment.authorized / payment.failed
 				return err
 			}
 		}

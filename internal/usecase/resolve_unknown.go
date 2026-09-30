@@ -15,8 +15,10 @@ const ReasonPSPNeverReceived = "psp_never_received"
 // ResolveUnknown descobre o desfecho de um pagamento em estado unknown perguntando ao PSP.
 // É a peça central da reconciliação (o job que a chama periodicamente vem no passo 7).
 type ResolveUnknown struct {
+	tx       TxRunner
 	payments payment.Repository
 	gateway  psp.Gateway
+	events   *EventRecorder
 	grace    time.Duration
 	now      func() time.Time
 }
@@ -24,8 +26,9 @@ type ResolveUnknown struct {
 // grace: quanto esperar antes de concluir "o PSP nunca recebeu". Um PSP pode estar com a
 // requisição numa fila; concluir cedo demais transformaria uma aprovação tardia em dinheiro
 // retido de um pagamento que já demos como falho.
-func NewResolveUnknown(payments payment.Repository, gateway psp.Gateway, grace time.Duration, now func() time.Time) *ResolveUnknown {
-	return &ResolveUnknown{payments: payments, gateway: gateway, grace: grace, now: now}
+func NewResolveUnknown(tx TxRunner, payments payment.Repository, gateway psp.Gateway, events *EventRecorder,
+	grace time.Duration, now func() time.Time) *ResolveUnknown {
+	return &ResolveUnknown{tx: tx, payments: payments, gateway: gateway, events: events, grace: grace, now: now}
 }
 
 // Execute é idempotente e seguro de rodar em paralelo: só age se o pagamento AINDA for
@@ -63,7 +66,14 @@ func (uc *ResolveUnknown) Execute(ctx context.Context, id payment.ID) (payment.S
 		return "", err
 	}
 
-	if err := uc.payments.Update(ctx, p); err != nil {
+	// O desfecho e o evento para o lojista (payment.authorized / payment.failed) andam juntos.
+	err = uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := uc.payments.Update(ctx, p); err != nil {
+			return err
+		}
+		return uc.events.Record(ctx, p)
+	})
+	if err != nil {
 		if errors.Is(err, payment.ErrConcurrentModification) {
 			// Outro reconciliador chegou primeiro: releia e devolva o que ficou valendo.
 			cur, gerr := uc.payments.GetByID(ctx, id)

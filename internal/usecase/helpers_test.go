@@ -16,6 +16,7 @@ import (
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/idempotency"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres/pgtest"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/outbox"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/psp"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
 )
@@ -184,6 +185,20 @@ func (f *faultyLedger) Post(ctx context.Context, t ledger.Transaction) error {
 	return f.Repository.Post(ctx, t)
 }
 
+// faultyOutbox falha o Add de eventos quando pedido: prova que estado e evento andam juntos.
+type faultyOutbox struct {
+	outbox.Repository
+	fail atomic.Bool
+	hook func() bool // se != nil e devolver true, esta chamada a Add falha (definir antes de usar)
+}
+
+func (f *faultyOutbox) Add(ctx context.Context, events ...outbox.Event) error {
+	if f.fail.Load() || (f.hook != nil && f.hook()) {
+		return errInjected
+	}
+	return f.Repository.Add(ctx, events...)
+}
+
 // ------------------------------------------------------------------ ambiente
 
 type env struct {
@@ -192,6 +207,7 @@ type env struct {
 	merchant string
 	keys     *faultyKeys
 	ledger   *faultyLedger
+	outbox   *faultyOutbox
 	psp      *fakePSP
 	payments *postgres.PaymentRepository
 
@@ -217,19 +233,21 @@ func setup(t *testing.T) *env {
 		ctx: ctx, pool: pool, psp: newFakePSP(),
 		keys:     &faultyKeys{Store: postgres.NewIdempotencyStore(txm, 30*time.Second)},
 		ledger:   &faultyLedger{Repository: postgres.NewLedgerRepository(txm)},
+		outbox:   &faultyOutbox{Repository: postgres.NewOutboxRepository(txm)},
 		payments: postgres.NewPaymentRepository(txm),
 		merchant: pgtest.Merchant(ctx, t, pool, "loja"),
 	}
 	e.clock.Store(t0.UnixNano())
 	now := func() time.Time { return time.Unix(0, e.clock.Load()).UTC() }
 
-	var paySeq, txSeq atomic.Int64
+	var paySeq, txSeq, evtSeq atomic.Int64
+	events := usecase.NewEventRecorder(e.outbox, func() string { return fmt.Sprintf("evt_%d", evtSeq.Add(1)) })
 	newPayID := func() payment.ID { return payment.ID(fmt.Sprintf("pay_%d", paySeq.Add(1))) }
 	newTxID := func() ledger.TransactionID { return ledger.TransactionID(fmt.Sprintf("ltx_%d", txSeq.Add(1))) }
 
-	e.create = usecase.NewCreatePayment(txm, e.payments, e.keys, e.psp, newPayID, now)
-	e.capture = usecase.NewCapturePayment(txm, e.payments, e.ledger, e.keys, e.psp, testFeeBps, newTxID, now)
-	e.resolve = usecase.NewResolveUnknown(e.payments, e.psp, testGrace, now)
+	e.create = usecase.NewCreatePayment(txm, e.payments, e.keys, e.psp, events, newPayID, now)
+	e.capture = usecase.NewCapturePayment(txm, e.payments, e.ledger, e.keys, e.psp, events, testFeeBps, newTxID, now)
+	e.resolve = usecase.NewResolveUnknown(txm, e.payments, e.psp, events, testGrace, now)
 	return e
 }
 
@@ -302,4 +320,29 @@ func (e *env) trialBalance(t testing.TB) int64 {
 		t.Fatal(err)
 	}
 	return diff
+}
+
+// eventTypes devolve os tipos de evento gravados na outbox, na ordem em que foram criados.
+func (e *env) eventTypes(t testing.TB) []string {
+	t.Helper()
+	rows, err := e.pool.Query(e.ctx, `SELECT type FROM outbox_events ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// events monta um EventRecorder novo sobre a outbox real (para testes que constroem casos de uso à mão).
+func (e *env) events() *usecase.EventRecorder {
+	var n atomic.Int64
+	return usecase.NewEventRecorder(e.outbox, func() string { return fmt.Sprintf("evt_x%d", n.Add(1)) })
 }

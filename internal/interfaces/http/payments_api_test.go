@@ -55,9 +55,12 @@ func newAPI(t *testing.T) *api {
 	gateway := pspclient.New(pspclient.Config{BaseURL: pspSrv.URL, AttemptTimeout: 100 * time.Millisecond,
 		MaxAttempts: 3, BaseBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond})
 
+	var evtSeq atomic.Int64
+	events := usecase.NewEventRecorder(postgres.NewOutboxRepository(txm), func() string { return fmt.Sprintf("evt_%d", evtSeq.Add(1)) })
+
 	h := handler.NewPayment(
-		usecase.NewCreatePayment(txm, payments, keys, gateway, newID, time.Now),
-		usecase.NewCapturePayment(txm, payments, postgres.NewLedgerRepository(txm), keys, gateway, 290, newLedgerTxID, time.Now),
+		usecase.NewCreatePayment(txm, payments, keys, gateway, events, newID, time.Now),
+		usecase.NewCapturePayment(txm, payments, postgres.NewLedgerRepository(txm), keys, gateway, events, 290, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
 	srv := httptest.NewServer(httpiface.NewRouter(handler.NewHealth(pool), h, postgres.NewMerchantAuthenticator(pool)))

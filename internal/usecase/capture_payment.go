@@ -34,15 +34,17 @@ type CapturePayment struct {
 	ledger   ledger.Repository
 	keys     idempotency.Store
 	gateway  psp.Gateway
+	events   *EventRecorder
 	feeBps   int64
 	newTxID  func() ledger.TransactionID
 	now      func() time.Time
 }
 
 func NewCapturePayment(tx TxRunner, payments payment.Repository, lg ledger.Repository, keys idempotency.Store,
-	gateway psp.Gateway, feeBasisPoints int64, newTxID func() ledger.TransactionID, now func() time.Time) *CapturePayment {
+	gateway psp.Gateway, events *EventRecorder, feeBasisPoints int64, newTxID func() ledger.TransactionID,
+	now func() time.Time) *CapturePayment {
 	return &CapturePayment{tx: tx, payments: payments, ledger: lg, keys: keys, gateway: gateway,
-		feeBps: feeBasisPoints, newTxID: newTxID, now: now}
+		events: events, feeBps: feeBasisPoints, newTxID: newTxID, now: now}
 }
 
 // Execute captura um pagamento autorizado.
@@ -51,8 +53,8 @@ func NewCapturePayment(tx TxRunner, payments payment.Repository, lg ledger.Repos
 // meio, o retry repete a captura no PSP (idempotente pela chave "capture:<id>") e só então
 // grava. O que NÃO pode acontecer, e não acontece, é gravar "capturado" sem o PSP ter capturado.
 //
-// Uma única transação grava: pagamento capturado + lançamentos do ledger + chave finalizada.
-// Ou os três entram, ou nenhum.
+// Uma única transação grava: pagamento capturado + lançamentos do ledger + evento na outbox +
+// chave finalizada. Ou os quatro entram, ou nenhum.
 func (uc *CapturePayment) Execute(ctx context.Context, in CapturePaymentInput) (CreatePaymentOutput, error) {
 	if err := idempotency.ValidateKey(in.IdempotencyKey); err != nil {
 		return CreatePaymentOutput{}, err
@@ -127,6 +129,9 @@ func (uc *CapturePayment) run(ctx context.Context, acq idempotency.Acquisition, 
 			return err
 		}
 		if err := uc.ledger.Post(ctx, entry); err != nil {
+			return err
+		}
+		if err := uc.events.Record(ctx, p); err != nil { // payment.captured
 			return err
 		}
 		return uc.keys.Finish(ctx, acq, body)

@@ -67,9 +67,12 @@ func run() error {
 		return ledger.TransactionID("ltx_" + strings.ReplaceAll(uuid.NewString(), "-", ""))
 	}
 
+	newEventID := func() string { return "evt_" + strings.ReplaceAll(uuid.NewString(), "-", "") }
+	events := usecase.NewEventRecorder(postgres.NewOutboxRepository(txm), newEventID)
+
 	paymentHandler := handler.NewPayment(
-		usecase.NewCreatePayment(txm, payments, keys, gateway, newID, time.Now),
-		usecase.NewCapturePayment(txm, payments, ledgerRepo, keys, gateway, cfg.PlatformFeeBps, newLedgerTxID, time.Now),
+		usecase.NewCreatePayment(txm, payments, keys, gateway, events, newID, time.Now),
+		usecase.NewCapturePayment(txm, payments, ledgerRepo, keys, gateway, events, cfg.PlatformFeeBps, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
 
