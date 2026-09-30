@@ -28,6 +28,9 @@ type Retention struct {
 type HousekeeperConfig struct {
 	Interval time.Duration
 	Batch    int // tamanho de cada DELETE: lotes pequenos não seguram lock por muito tempo
+
+	// OnPurged (opcional) recebe quantos registros cada lote apagou (métricas).
+	OnPurged func(policy string, n int64)
 }
 
 // Housekeeper aplica as políticas de retenção (chaves de idempotência, eventos entregues).
@@ -68,6 +71,9 @@ func (h *Housekeeper) RunOnce(ctx context.Context) {
 				break
 			}
 			total += n
+			if n > 0 && h.cfg.OnPurged != nil {
+				h.cfg.OnPurged(p.Name, n)
+			}
 			if n < int64(h.cfg.Batch) {
 				break
 			}

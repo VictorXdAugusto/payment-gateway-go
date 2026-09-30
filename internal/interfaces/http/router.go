@@ -10,7 +10,9 @@ import (
 
 // NewRouter registra as rotas usando o ServeMux da stdlib (Go 1.22+ aceita método no padrão).
 // /health e /ready ficam abertos (o orquestrador não tem API key); /v1/* exige autenticação.
-func NewRouter(health *handler.Health, payments *handler.Payment, auth middleware.Authenticator) http.Handler {
+//
+// recorder recebe a medição de cada requisição (nil = sem métricas).
+func NewRouter(health *handler.Health, payments *handler.Payment, auth middleware.Authenticator, recorder middleware.RequestRecorder) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", health.Live)
@@ -21,5 +23,5 @@ func NewRouter(health *handler.Health, payments *handler.Payment, auth middlewar
 	mux.Handle("POST /v1/payments/{id}/capture", authed(http.HandlerFunc(payments.Capture)))
 	mux.Handle("GET /v1/payments/{id}", authed(http.HandlerFunc(payments.Get)))
 
-	return middleware.Observe(mux)
+	return middleware.ObserveWith(recorder, mux)
 }

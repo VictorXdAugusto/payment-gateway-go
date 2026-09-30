@@ -20,6 +20,7 @@ import (
 	pspclient "github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/psp"
 	httpiface "github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http/handler"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/observability"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
 )
 
@@ -55,13 +56,18 @@ func run() error {
 	keys := postgres.NewIdempotencyStore(txm, cfg.IdempotencyLease)
 	newID := func() payment.ID { return payment.ID("pay_" + strings.ReplaceAll(uuid.NewString(), "-", "")) }
 
-	gateway := pspclient.New(pspclient.Config{
+	metrics := observability.New()
+	metrics.RegisterBacklog(postgres.NewStatsRepository(txm), 2*time.Second)
+	observability.Serve(ctx, ":"+cfg.MetricsPort, observability.OpsHandler(metrics, pool), logger)
+
+	rawGateway := pspclient.New(pspclient.Config{
 		BaseURL:        cfg.PSPBaseURL,
 		AttemptTimeout: cfg.PSPAttemptTimeout,
 		MaxAttempts:    cfg.PSPMaxAttempts,
 		BaseBackoff:    cfg.PSPBaseBackoff,
 		MaxBackoff:     cfg.PSPMaxBackoff,
 	})
+	gateway := observability.InstrumentGateway(rawGateway, metrics)
 	ledgerRepo := postgres.NewLedgerRepository(txm)
 	newLedgerTxID := func() ledger.TransactionID {
 		return ledger.TransactionID("ltx_" + strings.ReplaceAll(uuid.NewString(), "-", ""))
@@ -79,7 +85,7 @@ func run() error {
 	srv := &http.Server{
 		Addr: ":" + cfg.HTTPPort,
 		Handler: httpiface.NewRouter(handler.NewHealth(pool), paymentHandler,
-			postgres.NewMerchantAuthenticator(pool)),
+			postgres.NewMerchantAuthenticator(pool), metrics),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

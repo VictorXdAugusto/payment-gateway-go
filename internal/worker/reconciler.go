@@ -25,6 +25,11 @@ type ReconcilerConfig struct {
 	// MaxConsecutiveErrors interrompe a varredura quando o PSP parece fora do ar: insistir só
 	// gera carga num serviço doente. A próxima varredura tenta de novo.
 	MaxConsecutiveErrors int
+
+	// Hooks opcionais (métricas). OnResult: "resolved", "pending" ou "error", por pagamento.
+	OnResult func(result string)
+	// OnSweep: uma vez por varredura concluída (aborted = PSP parecia fora do ar).
+	OnSweep func(aborted bool)
 }
 
 // Report resume uma varredura.
@@ -78,6 +83,20 @@ func (r *Reconciler) Run(ctx context.Context) {
 // RunOnce percorre TODOS os pagamentos presos elegíveis, página a página, com cursor por id.
 // O cursor evita a fome: pagamentos que continuam presos não bloqueiam os que vêm depois.
 func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
+	rep, err := r.sweep(ctx)
+	if err == nil && ctx.Err() == nil && r.cfg.OnSweep != nil {
+		r.cfg.OnSweep(rep.Aborted)
+	}
+	return rep, err
+}
+
+func (r *Reconciler) result(res string) {
+	if r.cfg.OnResult != nil {
+		r.cfg.OnResult(res)
+	}
+}
+
+func (r *Reconciler) sweep(ctx context.Context) (Report, error) {
 	var (
 		rep         Report
 		after       payment.ID
@@ -99,6 +118,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 			case err != nil && ctx.Err() == nil:
 				rep.Errors++
 				consecutive++
+				r.result("error")
 				r.log.Warn("não foi possível reconciliar o pagamento", "payment_id", id, "error", err)
 				if consecutive >= r.cfg.MaxConsecutiveErrors {
 					rep.Aborted = true
@@ -109,9 +129,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 			case status == payment.StatusCreated || status == payment.StatusUnknown:
 				consecutive = 0
 				rep.Pending++
+				r.result("pending")
 			default:
 				consecutive = 0
 				rep.Resolved++
+				r.result("resolved")
 				r.log.Info("pagamento reconciliado", "payment_id", id, "status", status)
 			}
 		}

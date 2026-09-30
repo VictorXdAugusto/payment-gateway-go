@@ -23,6 +23,10 @@ type Config struct {
 	Lease        time.Duration // por quanto tempo uma entrega fica "reservada" a este worker
 	MaxAttempts  int           // depois disso, dead letter
 	Backoff      Backoff
+
+	// OnOutcome (opcional) é chamado uma vez por entrega processada: delivered, rescheduled,
+	// dead, skipped ou claim_lost. Serve às métricas; o dispatcher não conhece o destino.
+	OnOutcome func(outcome string)
 }
 
 type Dispatcher struct {
@@ -117,6 +121,14 @@ func (d *Dispatcher) process(ctx context.Context, del outbox.Delivery) {
 }
 
 func (d *Dispatcher) record(log *slog.Logger, err error, outcome string) {
+	if d.cfg.OnOutcome != nil {
+		switch {
+		case err == nil:
+			d.cfg.OnOutcome(outcome)
+		case errors.Is(err, outbox.ErrClaimLost):
+			d.cfg.OnOutcome("claim_lost")
+		}
+	}
 	switch {
 	case err == nil:
 		log.Info("entrega processada", "outcome", outcome)

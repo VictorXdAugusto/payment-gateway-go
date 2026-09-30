@@ -63,7 +63,7 @@ func newAPI(t *testing.T) *api {
 		usecase.NewCapturePayment(txm, payments, postgres.NewLedgerRepository(txm), keys, gateway, events, 290, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
-	srv := httptest.NewServer(httpiface.NewRouter(handler.NewHealth(pool), h, postgres.NewMerchantAuthenticator(pool)))
+	srv := httptest.NewServer(httpiface.NewRouter(handler.NewHealth(pool), h, postgres.NewMerchantAuthenticator(pool), nil))
 	t.Cleanup(srv.Close)
 
 	a := &api{t: t, srv: srv, sim: sim, pool: pool, keys: keys}

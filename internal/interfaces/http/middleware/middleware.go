@@ -65,9 +65,19 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// RequestRecorder recebe uma medição por requisição (métricas). route é o PADRÃO do mux que
+// atendeu ("POST /v1/payments"), nunca o caminho cru: caminhos com id criariam uma série por
+// pagamento. Requisição que não casou com rota nenhuma chega como "unmatched".
+type RequestRecorder interface {
+	HTTPRequest(method, route string, status int, d time.Duration)
+}
+
 // Observe gera o request id, registra a requisição e transforma pânico em 500
 // (um handler com bug não derruba o processo nem deixa o cliente sem resposta).
-func Observe(next http.Handler) http.Handler {
+func Observe(next http.Handler) http.Handler { return ObserveWith(nil, next) }
+
+// ObserveWith é Observe mais a medição de cada requisição em rec (nil = sem métricas).
+func ObserveWith(recorder RequestRecorder, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
 		if id == "" {
@@ -75,6 +85,7 @@ func Observe(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Request-Id", id)
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		inner := r.WithContext(context.WithValue(r.Context(), requestIDKey, id))
 		start := time.Now()
 
 		defer func() {
@@ -86,10 +97,18 @@ func Observe(next http.Handler) http.Handler {
 					_, _ = rec.Write([]byte(`{"error":{"code":"internal_error","message":"erro interno"}}` + "\n"))
 				}
 			}
-			slog.Info("requisição", "method", r.Method, "path", r.URL.Path, "status", rec.status,
-				"duration_ms", time.Since(start).Milliseconds(), "request_id", id)
+			elapsed := time.Since(start)
+			route := inner.Pattern // o mux preenche no request que ele recebe
+			if route == "" {
+				route = "unmatched"
+			}
+			if recorder != nil {
+				recorder.HTTPRequest(r.Method, route, rec.status, elapsed)
+			}
+			slog.Info("requisição", "method", r.Method, "path", r.URL.Path, "route", route, "status", rec.status,
+				"duration_ms", elapsed.Milliseconds(), "request_id", id)
 		}()
 
-		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), requestIDKey, id)))
+		next.ServeHTTP(rec, inner)
 	})
 }

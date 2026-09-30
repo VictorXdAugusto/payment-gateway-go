@@ -18,6 +18,7 @@ import (
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
 	pspclient "github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/psp"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/webhook"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/observability"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/worker"
 )
@@ -55,23 +56,28 @@ func run() error {
 	payments := postgres.NewPaymentRepository(txm)
 	keys := postgres.NewIdempotencyStore(txm, time.Minute) // o lease não é usado pela limpeza
 
+	metrics := observability.New()
+	metrics.RegisterBacklog(postgres.NewStatsRepository(txm), 2*time.Second)
+	observability.Serve(ctx, ":"+cfg.MetricsPort, observability.OpsHandler(metrics, pool), log)
+
 	gateway := pspclient.New(pspclient.Config{
 		BaseURL: cfg.PSPBaseURL, AttemptTimeout: cfg.PSPAttemptTimeout, MaxAttempts: cfg.PSPMaxAttempts,
 		BaseBackoff: cfg.PSPBaseBackoff, MaxBackoff: cfg.PSPMaxBackoff,
 	})
 	newEventID := func() string { return "evt_" + strings.ReplaceAll(uuid.NewString(), "-", "") }
-	resolve := usecase.NewResolveStuck(txm, payments, gateway, usecase.NewEventRecorder(outboxRepo, newEventID),
+	resolve := usecase.NewResolveStuck(txm, payments, observability.InstrumentGateway(gateway, metrics), usecase.NewEventRecorder(outboxRepo, newEventID),
 		cfg.UnknownGrace, time.Now)
 
 	reconciler := worker.NewReconciler(payments, resolve, worker.ReconcilerConfig{
 		Interval: cfg.ReconcileInterval, StaleAfter: cfg.ReconcileStaleAfter,
 		PageSize: cfg.ReconcilePageSize, MaxConsecutiveErrors: cfg.ReconcileMaxErrors,
+		OnResult: metrics.ReconcileResult, OnSweep: metrics.ReconcileSweep,
 	}, log, time.Now)
 
 	housekeeper := worker.NewHousekeeper([]worker.Retention{
 		{Name: "idempotency_keys", OlderThan: cfg.IdempotencyRetention, Purger: keys},
 		{Name: "outbox_events", OlderThan: cfg.OutboxRetention, Purger: outboxRepo},
-	}, worker.HousekeeperConfig{Interval: cfg.RetentionInterval, Batch: cfg.RetentionBatch}, log)
+	}, worker.HousekeeperConfig{Interval: cfg.RetentionInterval, Batch: cfg.RetentionBatch, OnPurged: metrics.RetentionDeleted}, log)
 
 	dispatcher := worker.NewDispatcher(
 		outboxRepo,
@@ -79,7 +85,8 @@ func run() error {
 		worker.Config{
 			BatchSize: cfg.BatchSize, Concurrency: cfg.Concurrency, PollInterval: cfg.PollInterval,
 			Lease: cfg.Lease, MaxAttempts: cfg.MaxAttempts,
-			Backoff: worker.Backoff{Base: cfg.BaseBackoff, Max: cfg.MaxBackoff},
+			Backoff:   worker.Backoff{Base: cfg.BaseBackoff, Max: cfg.MaxBackoff},
+			OnOutcome: metrics.DeliveryOutcome,
 		},
 		log,
 	)

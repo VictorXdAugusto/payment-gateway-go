@@ -12,7 +12,9 @@ import (
 )
 
 type Config struct {
-	HTTPPort        string
+	HTTPPort string
+	// MetricsPort: porta de operação (/metrics, /health, /ready), separada da API pública.
+	MetricsPort     string
 	DatabaseURL     string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
@@ -36,6 +38,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		HTTPPort:        getEnv("HTTP_PORT", "8080"),
+		MetricsPort:     getEnv("METRICS_PORT", "9102"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		ShutdownTimeout: 15 * time.Second,
 	}
@@ -122,6 +125,7 @@ func parseLevel(s string) (slog.Level, error) {
 // WorkerConfig é a configuração do processo de entrega de webhooks (cmd/worker).
 type WorkerConfig struct {
 	DatabaseURL string
+	MetricsPort string // porta de operação do worker (/metrics, /health, /ready)
 	LogLevel    slog.Level
 
 	BatchSize    int
@@ -156,7 +160,7 @@ type WorkerConfig struct {
 }
 
 func LoadWorker() (WorkerConfig, error) {
-	c := WorkerConfig{DatabaseURL: os.Getenv("DATABASE_URL")}
+	c := WorkerConfig{DatabaseURL: os.Getenv("DATABASE_URL"), MetricsPort: getEnv("METRICS_PORT", "9103")}
 	if c.DatabaseURL == "" {
 		return WorkerConfig{}, errors.New("DATABASE_URL é obrigatória")
 	}
