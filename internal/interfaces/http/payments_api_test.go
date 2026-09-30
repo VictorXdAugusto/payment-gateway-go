@@ -61,9 +61,13 @@ func newAPI(t *testing.T) *api {
 	h := handler.NewPayment(
 		usecase.NewCreatePayment(txm, payments, keys, gateway, events, newID, time.Now),
 		usecase.NewCapturePayment(txm, payments, postgres.NewLedgerRepository(txm), keys, gateway, events, 290, newLedgerTxID, time.Now),
+		usecase.NewVoidPayment(txm, payments, keys, gateway, events, time.Now),
+		usecase.NewRefundPayment(txm, payments, postgres.NewLedgerRepository(txm), keys, gateway, events, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
-	srv := httptest.NewServer(httpiface.NewRouter(handler.NewHealth(pool), h, postgres.NewMerchantAuthenticator(pool), nil))
+	srv := httptest.NewServer(httpiface.NewRouter(handler.NewHealth(pool), h,
+		handler.NewAccount(usecase.NewGetBalance(postgres.NewLedgerRepository(txm)), usecase.NewGetStatement(postgres.NewLedgerRepository(txm))),
+		postgres.NewMerchantAuthenticator(pool), nil))
 	t.Cleanup(srv.Close)
 
 	a := &api{t: t, srv: srv, sim: sim, pool: pool, keys: keys}
@@ -318,6 +322,16 @@ func (a *api) capture(id, idem string) resp {
 	return a.do("POST", "/v1/payments/"+id+"/capture", a.apiKey, idem, "")
 }
 
+func (a *api) void(id, idem string) resp {
+	a.t.Helper()
+	return a.do("POST", "/v1/payments/"+id+"/void", a.apiKey, idem, "")
+}
+
+func (a *api) refund(id, idem, body string) resp {
+	a.t.Helper()
+	return a.do("POST", "/v1/payments/"+id+"/refund", a.apiKey, idem, body)
+}
+
 func (a *api) balance(account ledger.AccountID) int64 {
 	a.t.Helper()
 	var v int64
@@ -466,4 +480,189 @@ func TestCapture_OverHTTP_Errors(t *testing.T) {
 			t.Errorf("status=%d body=%s", r.status, r.body)
 		}
 	})
+}
+
+func TestVoid_OverHTTP(t *testing.T) {
+	a := newAPI(t)
+	p := a.createOK("v-create", 10000)
+
+	first := a.void(p.ID, "void-1")
+	if first.status != 200 || a.view(t, first).Status != "voided" || first.header.Get("Idempotent-Replayed") != "" {
+		t.Fatalf("void: status=%d body=%s", first.status, first.body)
+	}
+	if got := a.balance(ledger.PSPClearing("BRL").ID); got != 0 {
+		t.Errorf("cancelar não move dinheiro: psp_clearing = %d", got)
+	}
+	retry := a.void(p.ID, "void-1")
+	if retry.status != 200 || retry.header.Get("Idempotent-Replayed") != "true" || retry.body != first.body {
+		t.Errorf("retry: status=%d replayed=%q", retry.status, retry.header.Get("Idempotent-Replayed"))
+	}
+
+	t.Run("sem Idempotency-Key: 400", func(t *testing.T) {
+		q := a.createOK("v-create-2", 1000)
+		if r := a.void(q.ID, ""); r.status != 400 || errorCode(t, r) != "missing_idempotency_key" {
+			t.Errorf("status=%d body=%s", r.status, r.body)
+		}
+	})
+	t.Run("capturado não cancela: 409 invalid_state", func(t *testing.T) {
+		q := a.createOK("v-create-3", 1000)
+		a.capture(q.ID, "v-cap")
+		if r := a.void(q.ID, "v-k3"); r.status != 409 || errorCode(t, r) != "invalid_state" {
+			t.Errorf("status=%d body=%s", r.status, r.body)
+		}
+	})
+	t.Run("inexistente: 404", func(t *testing.T) {
+		if r := a.void("nao_existe", "v-k4"); r.status != 404 {
+			t.Errorf("status=%d", r.status)
+		}
+	})
+	t.Run("PSP fora do ar no cancelamento: 502 e continua authorized", func(t *testing.T) {
+		q := a.createOK("v-create-5", pspsim.AmountVoidDown)
+		r := a.void(q.ID, "v-k5")
+		if r.status != 502 || errorCode(t, r) != "psp_unavailable" {
+			t.Errorf("status=%d body=%s", r.status, r.body)
+		}
+		if g := a.do("GET", "/v1/payments/"+q.ID, a.apiKey, "", ""); a.view(t, g).Status != "authorized" {
+			t.Errorf("GET: %s", g.body)
+		}
+	})
+}
+
+func TestRefund_OverHTTP_MovesTheLedgerAndKeepsTheLimit(t *testing.T) {
+	a := newAPI(t)
+	p := a.createOK("r-create", 10000)
+	a.capture(p.ID, "r-cap")
+
+	first := a.refund(p.ID, "ref-1", `{"amount":4000}`)
+	v := a.view(t, first)
+	if first.status != 200 || v.Status != "partially_refunded" || v.RefundedAmount != 4000 {
+		t.Fatalf("estorno: status=%d body=%s", first.status, first.body)
+	}
+	if got := a.balance(ledger.PSPClearing("BRL").ID); got != 6000 {
+		t.Errorf("psp_clearing = %d, want 6000", got)
+	}
+	if retry := a.refund(p.ID, "ref-1", `{"amount":4000}`); retry.header.Get("Idempotent-Replayed") != "true" || retry.body != first.body {
+		t.Errorf("retry: %d %q", retry.status, retry.header.Get("Idempotent-Replayed"))
+	}
+	if got := a.balance(ledger.PSPClearing("BRL").ID); got != 6000 {
+		t.Errorf("o retry devolveu de novo: psp_clearing = %d", got)
+	}
+
+	if r := a.refund(p.ID, "ref-2", `{"amount":6001}`); r.status != 422 || errorCode(t, r) != "refund_exceeds_captured" {
+		t.Errorf("acima do restante: status=%d body=%s", r.status, r.body)
+	}
+	if r := a.refund(p.ID, "ref-3", `{"amount":6000}`); a.view(t, r).Status != "refunded" {
+		t.Errorf("estorno final: %s", r.body)
+	}
+	if r := a.refund(p.ID, "ref-4", `{"amount":1}`); r.status != 409 || errorCode(t, r) != "invalid_state" {
+		t.Errorf("já estornado: status=%d body=%s", r.status, r.body)
+	}
+}
+
+func TestRefund_OverHTTP_Errors(t *testing.T) {
+	a := newAPI(t)
+	p := a.createOK("re-create", 10000)
+	a.capture(p.ID, "re-cap")
+
+	for name, tc := range map[string]struct {
+		key, body string
+		status    int
+		code      string
+	}{
+		"sem Idempotency-Key":  {"", `{"amount":100}`, 400, "missing_idempotency_key"},
+		"sem amount":           {"k1", `{}`, 400, "invalid_request"},
+		"amount zero":          {"k2", `{"amount":0}`, 400, "invalid_request"},
+		"amount negativo":      {"k3", `{"amount":-5}`, 400, "invalid_request"},
+		"campo desconhecido":   {"k4", `{"amount":100,"extra":1}`, 400, "invalid_request"},
+		"corpo que não é JSON": {"k5", `nao`, 400, "invalid_request"},
+		"amount não inteiro":   {"k6", `{"amount":1.5}`, 400, "invalid_request"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := a.refund(p.ID, tc.key, tc.body)
+			if r.status != tc.status || errorCode(t, r) != tc.code {
+				t.Errorf("status=%d body=%s, want %d %s", r.status, r.body, tc.status, tc.code)
+			}
+		})
+	}
+	t.Run("não capturado: 409", func(t *testing.T) {
+		q := a.createOK("re-create-2", 1000)
+		if r := a.refund(q.ID, "k7", `{"amount":100}`); r.status != 409 || errorCode(t, r) != "invalid_state" {
+			t.Errorf("status=%d body=%s", r.status, r.body)
+		}
+	})
+	t.Run("PSP fora do ar: 502 e nada muda", func(t *testing.T) {
+		q := a.createOK("re-create-3", pspsim.AmountRefundDown)
+		a.capture(q.ID, "re-cap-3")
+		r := a.refund(q.ID, "k8", `{"amount":100}`)
+		if r.status != 502 || errorCode(t, r) != "psp_unavailable" {
+			t.Errorf("status=%d body=%s", r.status, r.body)
+		}
+		if g := a.do("GET", "/v1/payments/"+q.ID, a.apiKey, "", ""); a.view(t, g).RefundedAmount != 0 {
+			t.Errorf("GET: %s", g.body)
+		}
+	})
+	t.Run("pagamento de outro lojista: 404", func(t *testing.T) {
+		other, _ := a.newMerchant(context.Background(), "intrusa-refund")
+		if r := a.do("POST", "/v1/payments/"+p.ID+"/refund", other, "k9", `{"amount":100}`); r.status != 404 {
+			t.Errorf("status=%d", r.status)
+		}
+	})
+}
+
+func TestBalanceAndStatement_OverHTTP(t *testing.T) {
+	a := newAPI(t)
+
+	r := a.do("GET", "/v1/balance", a.apiKey, "", "")
+	if r.status != 200 || !strings.Contains(r.body, `"balances":[]`) {
+		t.Fatalf("saldo vazio: status=%d body=%s", r.status, r.body)
+	}
+
+	p := a.createOK("b-create", 10000)
+	a.capture(p.ID, "b-cap")
+	a.refund(p.ID, "b-ref", `{"amount":4000}`)
+
+	r = a.do("GET", "/v1/balance", a.apiKey, "", "")
+	var bal struct {
+		Balances []usecase.BalanceView `json:"balances"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &bal); err != nil || len(bal.Balances) != 1 || bal.Balances[0].Amount != 5710 {
+		t.Fatalf("saldo: status=%d body=%s", r.status, r.body)
+	}
+
+	r = a.do("GET", "/v1/statement?limit=1", a.apiKey, "", "")
+	var page usecase.StatementPage
+	if err := json.Unmarshal([]byte(r.body), &page); err != nil || len(page.Data) != 1 || page.Data[0].Type != "refund" || page.NextBefore == nil {
+		t.Fatalf("página 1: status=%d body=%s", r.status, r.body)
+	}
+	r = a.do("GET", fmt.Sprintf("/v1/statement?limit=1&before=%d", *page.NextBefore), a.apiKey, "", "")
+	var page2 usecase.StatementPage
+	if err := json.Unmarshal([]byte(r.body), &page2); err != nil || len(page2.Data) != 1 || page2.Data[0].Type != "capture" || page2.NextBefore != nil {
+		t.Fatalf("página 2: status=%d body=%s", r.status, r.body)
+	}
+}
+
+func TestBalanceAndStatement_AreAuthenticatedAndIsolated(t *testing.T) {
+	a := newAPI(t)
+	p := a.createOK("i-create", 10000)
+	a.capture(p.ID, "i-cap")
+
+	for _, path := range []string{"/v1/balance", "/v1/statement"} {
+		if r := a.do("GET", path, "", "", ""); r.status != 401 {
+			t.Errorf("%s sem chave: status=%d", path, r.status)
+		}
+	}
+	other, _ := a.newMerchant(context.Background(), "intrusa-extrato")
+	if r := a.do("GET", "/v1/statement", other, "", ""); r.status != 200 || !strings.Contains(r.body, `"data":[]`) {
+		t.Errorf("extrato de outro lojista vazou: %s", r.body)
+	}
+}
+
+func TestStatement_InvalidParameters_Return400(t *testing.T) {
+	a := newAPI(t)
+	for _, q := range []string{"limit=abc", "limit=0x", "before=x", "limit=-1", "limit=101", "before=-3"} {
+		r := a.do("GET", "/v1/statement?"+q, a.apiKey, "", "")
+		if r.status != 400 || errorCode(t, r) != "invalid_request" {
+			t.Errorf("?%s: status=%d body=%s", q, r.status, r.body)
+		}
+	}
 }

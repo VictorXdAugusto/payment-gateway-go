@@ -49,6 +49,14 @@ func writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
 			"o adquirente não confirmou a operação; repita a requisição com a mesma Idempotency-Key")
 	case errors.Is(err, usecase.ErrCaptureRejected):
 		writeError(w, http.StatusUnprocessableEntity, "capture_rejected", "o adquirente recusou a captura")
+	case errors.Is(err, usecase.ErrVoidRejected):
+		writeError(w, http.StatusUnprocessableEntity, "void_rejected", "o adquirente recusou o cancelamento")
+	case errors.Is(err, usecase.ErrRefundRejected):
+		writeError(w, http.StatusUnprocessableEntity, "refund_rejected", "o adquirente recusou o estorno")
+	case errors.Is(err, payment.ErrRefundExceedsCaptured):
+		writeError(w, http.StatusUnprocessableEntity, "refund_exceeds_captured", err.Error())
+	case errors.Is(err, payment.ErrInvalidAmount):
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, payment.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "pagamento não encontrado")
 	default:

@@ -21,6 +21,14 @@ type CapturePaymentUseCase interface {
 	Execute(ctx context.Context, in usecase.CapturePaymentInput) (usecase.CreatePaymentOutput, error)
 }
 
+type VoidPaymentUseCase interface {
+	Execute(ctx context.Context, in usecase.VoidPaymentInput) (usecase.CreatePaymentOutput, error)
+}
+
+type RefundPaymentUseCase interface {
+	Execute(ctx context.Context, in usecase.RefundPaymentInput) (usecase.CreatePaymentOutput, error)
+}
+
 type GetPaymentUseCase interface {
 	Execute(ctx context.Context, merchantID, id string) (usecase.PaymentView, error)
 }
@@ -28,11 +36,14 @@ type GetPaymentUseCase interface {
 type Payment struct {
 	create  CreatePaymentUseCase
 	capture CapturePaymentUseCase
+	void    VoidPaymentUseCase
+	refund  RefundPaymentUseCase
 	get     GetPaymentUseCase
 }
 
-func NewPayment(create CreatePaymentUseCase, capture CapturePaymentUseCase, get GetPaymentUseCase) *Payment {
-	return &Payment{create: create, capture: capture, get: get}
+func NewPayment(create CreatePaymentUseCase, capture CapturePaymentUseCase, void VoidPaymentUseCase,
+	refund RefundPaymentUseCase, get GetPaymentUseCase) *Payment {
+	return &Payment{create: create, capture: capture, void: void, refund: refund, get: get}
 }
 
 type createPaymentRequest struct {
@@ -93,6 +104,66 @@ func (h *Payment) Capture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if out.Replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeJSON(w, http.StatusOK, out.Payment)
+}
+
+// Void: POST /v1/payments/{id}/void  (header Idempotency-Key obrigatório, sem corpo)
+func (h *Payment) Void(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "o header Idempotency-Key é obrigatório")
+		return
+	}
+
+	out, err := h.void.Execute(r.Context(), usecase.VoidPaymentInput{
+		MerchantID:     middleware.MerchantID(r.Context()),
+		PaymentID:      r.PathValue("id"),
+		IdempotencyKey: key,
+	})
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	if out.Replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeJSON(w, http.StatusOK, out.Payment)
+}
+
+type refundRequest struct {
+	Amount *int64 `json:"amount"` // obrigatório e explícito: dinheiro nunca tem "padrão"
+}
+
+// Refund: POST /v1/payments/{id}/refund  {"amount": <centavos>}  (header Idempotency-Key obrigatório)
+func (h *Payment) Refund(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "o header Idempotency-Key é obrigatório")
+		return
+	}
+	var req refundRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if req.Amount == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "amount é obrigatório")
+		return
+	}
+
+	out, err := h.refund.Execute(r.Context(), usecase.RefundPaymentInput{
+		MerchantID:     middleware.MerchantID(r.Context()),
+		PaymentID:      r.PathValue("id"),
+		Amount:         *req.Amount,
+		IdempotencyKey: key,
+	})
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
 	if out.Replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}

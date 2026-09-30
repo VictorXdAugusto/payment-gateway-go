@@ -79,12 +79,16 @@ func run() error {
 	paymentHandler := handler.NewPayment(
 		usecase.NewCreatePayment(txm, payments, keys, gateway, events, newID, time.Now),
 		usecase.NewCapturePayment(txm, payments, ledgerRepo, keys, gateway, events, cfg.PlatformFeeBps, newLedgerTxID, time.Now),
+		usecase.NewVoidPayment(txm, payments, keys, gateway, events, time.Now),
+		usecase.NewRefundPayment(txm, payments, ledgerRepo, keys, gateway, events, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
 
+	accountHandler := handler.NewAccount(usecase.NewGetBalance(ledgerRepo), usecase.NewGetStatement(ledgerRepo))
+
 	srv := &http.Server{
 		Addr: ":" + cfg.HTTPPort,
-		Handler: httpiface.NewRouter(handler.NewHealth(pool), paymentHandler,
+		Handler: httpiface.NewRouter(handler.NewHealth(pool), paymentHandler, accountHandler,
 			postgres.NewMerchantAuthenticator(pool), metrics),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
