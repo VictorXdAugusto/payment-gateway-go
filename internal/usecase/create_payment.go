@@ -11,10 +11,20 @@ import (
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/money"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/idempotency"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/psp"
 )
 
-// pointPaymentCreated: o pagamento já foi gravado. Um retry a partir daqui NÃO cria outro.
-const pointPaymentCreated = "payment_created"
+// Recovery points de CreatePayment, em ordem:
+//
+//	started -> payment_created -> psp_resolved -> finished
+//
+//	payment_created: o pagamento existe. Um retry daqui NÃO cria outro.
+//	psp_resolved:    o desfecho do PSP (aprovado, recusado ou desconhecido) já foi gravado.
+//	                 Um retry daqui NÃO chama o PSP de novo.
+const (
+	pointPaymentCreated = "payment_created"
+	pointPSPResolved    = "psp_resolved"
+)
 
 // TxRunner executa fn numa transação; *postgres.TxManager satisfaz esta interface.
 type TxRunner interface {
@@ -37,13 +47,14 @@ type CreatePayment struct {
 	tx       TxRunner
 	payments payment.Repository
 	keys     idempotency.Store
+	gateway  psp.Gateway
 	newID    func() payment.ID
 	now      func() time.Time
 }
 
-func NewCreatePayment(tx TxRunner, payments payment.Repository, keys idempotency.Store,
+func NewCreatePayment(tx TxRunner, payments payment.Repository, keys idempotency.Store, gateway psp.Gateway,
 	newID func() payment.ID, now func() time.Time) *CreatePayment {
-	return &CreatePayment{tx: tx, payments: payments, keys: keys, newID: newID, now: now}
+	return &CreatePayment{tx: tx, payments: payments, keys: keys, gateway: gateway, newID: newID, now: now}
 }
 
 // Execute cria um pagamento no máximo UMA vez por (lojista, chave), aconteça o que acontecer:
@@ -90,12 +101,13 @@ func (uc *CreatePayment) Execute(ctx context.Context, in CreatePaymentInput) (Cr
 // run executa as fases a partir do recovery point. Cada fase grava seus efeitos e avança
 // o ponto NA MESMA TRANSAÇÃO: não existe estado "criou mas não anotou".
 func (uc *CreatePayment) run(ctx context.Context, acq idempotency.Acquisition, in CreatePaymentInput, amount money.Money) (PaymentView, error) {
+	merchantID := payment.MerchantID(in.MerchantID)
 	paymentID := payment.ID(acq.ResourceID)
+	point := acq.RecoveryPoint
 
-	switch acq.RecoveryPoint {
-	case idempotency.PointStarted:
-		// Fase 1: criar o pagamento.
-		p, err := payment.New(uc.newID(), payment.MerchantID(in.MerchantID), amount, uc.now())
+	// Fase 1: criar o pagamento.
+	if point == idempotency.PointStarted {
+		p, err := payment.New(uc.newID(), merchantID, amount, uc.now())
 		if err != nil {
 			return PaymentView{}, err
 		}
@@ -110,17 +122,23 @@ func (uc *CreatePayment) run(ctx context.Context, acq idempotency.Acquisition, i
 		if err != nil {
 			return PaymentView{}, err
 		}
-		paymentID = p.ID()
+		paymentID, point = p.ID(), pointPaymentCreated
+	}
 
-	case pointPaymentCreated:
-		// A fase 1 já foi commitada por uma execução anterior: retoma daqui.
+	// Fase 2: autorizar no PSP e gravar o desfecho.
+	if point == pointPaymentCreated {
+		if err := uc.authorize(ctx, acq, merchantID, paymentID); err != nil {
+			return PaymentView{}, err
+		}
+		point = pointPSPResolved
+	}
 
-	default:
+	if point != pointPSPResolved {
 		return PaymentView{}, fmt.Errorf("recovery point desconhecido %q", acq.RecoveryPoint)
 	}
 
 	// Fase final: relê do banco (assim a 1ª resposta, o replay e o GET são idênticos) e finaliza.
-	p, err := uc.payments.Get(ctx, payment.MerchantID(in.MerchantID), paymentID)
+	p, err := uc.payments.Get(ctx, merchantID, paymentID)
 	if err != nil {
 		return PaymentView{}, err
 	}
@@ -135,6 +153,52 @@ func (uc *CreatePayment) run(ctx context.Context, acq idempotency.Acquisition, i
 		return PaymentView{}, err
 	}
 	return view, nil
+}
+
+// authorize chama o PSP FORA de qualquer transação de banco (não se segura conexão nem
+// lock enquanto se espera um serviço externo) e grava o desfecho junto com o avanço do ponto.
+//
+// A chave de idempotência do PSP é o id do PAGAMENTO: estável entre retries. Se o processo
+// cair depois do PSP aprovar e antes de gravarmos, o retry chama o PSP de novo, recebe a
+// MESMA autorização e segue. Nunca há duas.
+func (uc *CreatePayment) authorize(ctx context.Context, acq idempotency.Acquisition, merchantID payment.MerchantID, id payment.ID) error {
+	p, err := uc.payments.Get(ctx, merchantID, id)
+	if err != nil {
+		return err
+	}
+
+	changed := false
+	if p.Status() == payment.StatusCreated {
+		auth, pspErr := uc.gateway.Authorize(ctx, psp.AuthorizeRequest{IdempotencyKey: string(p.ID()), Amount: p.Amount()})
+
+		now := uc.now()
+		var declined *psp.DeclinedError
+		switch {
+		case pspErr == nil:
+			err = p.Authorize(auth.Reference, now)
+		case errors.As(pspErr, &declined):
+			err = p.Fail(declined.Code, now)
+		case errors.Is(pspErr, psp.ErrIndeterminate):
+			// Não sabemos se aprovou. NÃO assumimos falha: fica unknown até a reconciliação.
+			err = p.MarkUnknown(now)
+		default:
+			// Cancelamento ou bug de contrato: nada foi decidido, o estado não muda.
+			return pspErr
+		}
+		if err != nil {
+			return err
+		}
+		changed = true
+	}
+
+	return uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if changed { // se o pagamento já tinha saído de created, só falta avançar o ponto
+			if err := uc.payments.Update(ctx, p); err != nil {
+				return err
+			}
+		}
+		return uc.keys.Advance(ctx, acq, pointPSPResolved, "")
+	})
 }
 
 func parseAmount(cents int64, currency string) (money.Money, error) {

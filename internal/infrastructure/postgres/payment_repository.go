@@ -44,20 +44,29 @@ func (r *PaymentRepository) Insert(ctx context.Context, p *payment.Payment, idem
 	return nil
 }
 
+const selectPayment = `
+	SELECT id, merchant_id::text, amount, currency, refunded_amount, status,
+	       psp_reference, failure_reason, version, created_at, updated_at
+	  FROM payments`
+
 func (r *PaymentRepository) Get(ctx context.Context, merchantID payment.MerchantID, id payment.ID) (*payment.Payment, error) {
+	return r.scan(r.tx.DB(ctx).QueryRow(ctx, selectPayment+` WHERE merchant_id = $1::uuid AND id = $2`,
+		string(merchantID), string(id)), id)
+}
+
+func (r *PaymentRepository) GetByID(ctx context.Context, id payment.ID) (*payment.Payment, error) {
+	return r.scan(r.tx.DB(ctx).QueryRow(ctx, selectPayment+` WHERE id = $1`, string(id)), id)
+}
+
+func (r *PaymentRepository) scan(row pgx.Row, id payment.ID) (*payment.Payment, error) {
 	var (
 		s                     payment.Snapshot
 		amount, refunded      int64
 		currency, status      string
 		merchant, pspRef, why string
 	)
-	err := r.tx.DB(ctx).QueryRow(ctx, `
-		SELECT id, merchant_id::text, amount, currency, refunded_amount, status,
-		       psp_reference, failure_reason, version, created_at, updated_at
-		  FROM payments
-		 WHERE merchant_id = $1::uuid AND id = $2`, string(merchantID), string(id)).
-		Scan(&s.ID, &merchant, &amount, &currency, &refunded, &status,
-			&pspRef, &why, &s.Version, &s.CreatedAt, &s.UpdatedAt)
+	err := row.Scan(&s.ID, &merchant, &amount, &currency, &refunded, &status,
+		&pspRef, &why, &s.Version, &s.CreatedAt, &s.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, payment.ErrNotFound
 	}

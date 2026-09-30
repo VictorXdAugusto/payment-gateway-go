@@ -19,6 +19,9 @@ type Repository interface {
 	// Get busca o pagamento de UM lojista. Id de outro lojista é ErrNotFound, nunca vaza.
 	Get(ctx context.Context, merchantID MerchantID, id ID) (*Payment, error)
 
+	// GetByID busca sem escopo de lojista. Uso INTERNO (reconciliação); a API nunca deve usá-lo.
+	GetByID(ctx context.Context, id ID) (*Payment, error)
+
 	// Update grava as mudanças com lock otimista: só vale se a versão no banco ainda for a
 	// que o agregado tinha quando foi carregado. Senão, ErrConcurrentModification.
 	// Depois de um Update bem-sucedido, recarregue o agregado antes de mudá-lo de novo.
