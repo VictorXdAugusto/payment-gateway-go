@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -118,4 +119,28 @@ func (r *PaymentRepository) Update(ctx context.Context, p *payment.Payment) erro
 		return payment.ErrNotFound
 	}
 	return payment.ErrConcurrentModification
+}
+
+// ListStuck usa o índice parcial payments_stuck_idx: só pagamentos created/unknown entram nele,
+// então a varredura custa proporcional ao que está preso, não ao total de pagamentos.
+func (r *PaymentRepository) ListStuck(ctx context.Context, before time.Time, afterID payment.ID, limit int) ([]payment.ID, error) {
+	rows, err := r.tx.DB(ctx).Query(ctx, `
+		SELECT id FROM payments
+		 WHERE status IN ('created', 'unknown') AND updated_at < $1 AND id > $2
+		 ORDER BY id
+		 LIMIT $3`, before, string(afterID), limit)
+	if err != nil {
+		return nil, fmt.Errorf("listar pagamentos presos: %w", err)
+	}
+	defer rows.Close()
+
+	var out []payment.ID
+	for rows.Next() {
+		var id payment.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }

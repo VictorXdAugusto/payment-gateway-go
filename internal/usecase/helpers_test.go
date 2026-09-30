@@ -213,7 +213,7 @@ type env struct {
 
 	create  *usecase.CreatePayment
 	capture *usecase.CapturePayment
-	resolve *usecase.ResolveUnknown
+	resolve *usecase.ResolveStuck
 
 	clock atomic.Int64 // unix nano do "agora" controlável
 }
@@ -247,7 +247,7 @@ func setup(t *testing.T) *env {
 
 	e.create = usecase.NewCreatePayment(txm, e.payments, e.keys, e.psp, events, newPayID, now)
 	e.capture = usecase.NewCapturePayment(txm, e.payments, e.ledger, e.keys, e.psp, events, testFeeBps, newTxID, now)
-	e.resolve = usecase.NewResolveUnknown(txm, e.payments, e.psp, events, testGrace, now)
+	e.resolve = usecase.NewResolveStuck(txm, e.payments, e.psp, events, testGrace, now)
 	return e
 }
 

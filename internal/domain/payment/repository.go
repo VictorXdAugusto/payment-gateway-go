@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var (
@@ -21,6 +22,11 @@ type Repository interface {
 
 	// GetByID busca sem escopo de lojista. Uso INTERNO (reconciliação); a API nunca deve usá-lo.
 	GetByID(ctx context.Context, id ID) (*Payment, error)
+
+	// ListStuck devolve, em ordem de id, até limit pagamentos presos (created ou unknown) cuja
+	// última mudança é anterior a before e cujo id é maior que afterID (paginação por cursor:
+	// "" começa do início). Uso INTERNO (reconciliação).
+	ListStuck(ctx context.Context, before time.Time, afterID ID, limit int) ([]ID, error)
 
 	// Update grava as mudanças com lock otimista: só vale se a versão no banco ainda for a
 	// que o agregado tinha quando foi carregado. Senão, ErrConcurrentModification.

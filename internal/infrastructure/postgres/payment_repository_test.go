@@ -183,3 +183,57 @@ func TestPaymentRepository_ConcurrentRefunds_NeverExceedCaptured(t *testing.T) {
 	}
 	t.Logf("conflitos resolvidos por retry: %d", retries.Load())
 }
+
+// insertAt grava um pagamento no estado pedido com updated_at fixo, para testar a varredura.
+func (e *env) insertAt(t testing.TB, id, status string, updated time.Time) {
+	t.Helper()
+	if err := e.payments().Insert(e.ctx, e.newPayment(t, id, 100), "k-"+id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE payments SET status = $2, updated_at = $3 WHERE id = $1`,
+		id, status, updated); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPaymentRepository_ListStuck_OnlyStuckAndOldEnough(t *testing.T) {
+	e := setup(t)
+	old, recent := now.Add(-time.Hour), now.Add(-time.Second)
+	e.insertAt(t, "pay_a", "unknown", old)
+	e.insertAt(t, "pay_b", "created", old)
+	e.insertAt(t, "pay_c", "unknown", recent) // parado há pouco: pode ter requisição viva
+	e.insertAt(t, "pay_d", "authorized", old) // não está preso
+	e.insertAt(t, "pay_e", "failed", old)     // terminal
+
+	got, err := e.payments().ListStuck(e.ctx, now.Add(-time.Minute), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "pay_a" || got[1] != "pay_b" {
+		t.Fatalf("ListStuck = %v, want [pay_a pay_b]", got)
+	}
+}
+
+func TestPaymentRepository_ListStuck_PaginatesWithACursor(t *testing.T) {
+	e := setup(t)
+	for _, id := range []string{"pay_1", "pay_2", "pay_3", "pay_4", "pay_5"} {
+		e.insertAt(t, id, "unknown", now.Add(-time.Hour))
+	}
+
+	var all []payment.ID
+	var after payment.ID
+	for pages := 0; pages < 10; pages++ {
+		page, err := e.payments().ListStuck(e.ctx, now, after, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		all = append(all, page...)
+		after = page[len(page)-1]
+	}
+	if len(all) != 5 || all[0] != "pay_1" || all[4] != "pay_5" {
+		t.Fatalf("paginação = %v, want pay_1..pay_5 sem repetir nem pular", all)
+	}
+}

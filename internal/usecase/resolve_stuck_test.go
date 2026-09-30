@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/money"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
@@ -28,7 +29,7 @@ func unknownPayment(t *testing.T, e *env, mode authMode) payment.ID {
 }
 
 // O PSP aprovou e a resposta se perdeu. A reconciliação descobre a verdade.
-func TestResolveUnknown_PSPHadApproved_BecomesAuthorized(t *testing.T) {
+func TestResolveStuck_PSPHadApproved_BecomesAuthorized(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 
@@ -45,7 +46,7 @@ func TestResolveUnknown_PSPHadApproved_BecomesAuthorized(t *testing.T) {
 	}
 }
 
-func TestResolveUnknown_PSPHadDeclined_BecomesFailed(t *testing.T) {
+func TestResolveStuck_PSPHadDeclined_BecomesFailed(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 	// O PSP acabou recusando (registrado do lado dele) enquanto ficamos sem resposta.
@@ -65,7 +66,7 @@ func TestResolveUnknown_PSPHadDeclined_BecomesFailed(t *testing.T) {
 
 // O PSP não conhece a tentativa. Antes da carência NÃO se conclui nada (pode estar em fila);
 // depois dela, conclui-se que nunca chegou.
-func TestResolveUnknown_NotFound_WaitsForGracePeriodThenFails(t *testing.T) {
+func TestResolveStuck_NotFound_WaitsForGracePeriodThenFails(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutLost)
 
@@ -90,7 +91,7 @@ func TestResolveUnknown_NotFound_WaitsForGracePeriodThenFails(t *testing.T) {
 }
 
 // Aprovação que aparece só depois da carência ainda vence: o Lookup manda no desfecho.
-func TestResolveUnknown_LateApproval_StillWinsOverGracePeriod(t *testing.T) {
+func TestResolveStuck_LateApproval_StillWinsOverGracePeriod(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 	e.advanceClock(time.Hour)
@@ -100,7 +101,7 @@ func TestResolveUnknown_LateApproval_StillWinsOverGracePeriod(t *testing.T) {
 	}
 }
 
-func TestResolveUnknown_PSPDown_KeepsUnknownAndReportsTheError(t *testing.T) {
+func TestResolveStuck_PSPDown_KeepsUnknownAndReportsTheError(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 	e.psp.lookupErr = errors.New("PSP fora do ar")
@@ -114,7 +115,7 @@ func TestResolveUnknown_PSPDown_KeepsUnknownAndReportsTheError(t *testing.T) {
 	}
 }
 
-func TestResolveUnknown_OnlyActsOnUnknownPayments(t *testing.T) {
+func TestResolveStuck_OnlyActsOnStuckPayments(t *testing.T) {
 	e := setup(t)
 	id := e.created(t, "k1", 5000) // authorized
 	before := e.psp.lookups()
@@ -133,7 +134,7 @@ func TestResolveUnknown_OnlyActsOnUnknownPayments(t *testing.T) {
 
 // 12 reconciliadores rodando ao mesmo tempo sobre o mesmo pagamento: todos terminam com o
 // mesmo desfecho e a transição acontece uma única vez (lock otimista).
-func TestResolveUnknown_ConcurrentReconcilers_AgreeOnTheOutcome(t *testing.T) {
+func TestResolveStuck_ConcurrentReconcilers_AgreeOnTheOutcome(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 
@@ -192,11 +193,11 @@ func (b *barrierRepo) GetByID(ctx context.Context, id payment.ID) (*payment.Paym
 	return p, nil
 }
 
-func TestResolveUnknown_LosingTheOptimisticLockRace_ReturnsTheWinnersOutcome(t *testing.T) {
+func TestResolveStuck_LosingTheOptimisticLockRace_ReturnsTheWinnersOutcome(t *testing.T) {
 	e := setup(t)
 	id := unknownPayment(t, e, modeTimeoutHappened)
 
-	resolver := usecase.NewResolveUnknown(postgres.NewTxManager(e.pool), newBarrierRepo(e.payments, 2), e.psp, e.events(), testGrace,
+	resolver := usecase.NewResolveStuck(postgres.NewTxManager(e.pool), newBarrierRepo(e.payments, 2), e.psp, e.events(), testGrace,
 		func() time.Time { return time.Unix(0, e.clock.Load()).UTC() })
 
 	var wg sync.WaitGroup
@@ -214,5 +215,101 @@ func TestResolveUnknown_LosingTheOptimisticLockRace_ReturnsTheWinnersOutcome(t *
 
 	if p := e.load(t, string(id)); p.Status() != payment.StatusAuthorized || p.Version() != 2 {
 		t.Errorf("status=%s version=%d, want authorized e 2 (uma única transição)", p.Status(), p.Version())
+	}
+}
+
+func brl(t testing.TB, cents int64) money.Money {
+	t.Helper()
+	m, err := money.New(cents, money.BRL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// abandoned grava um pagamento created sem desfecho: o processo caiu depois do INSERT e o
+// cliente nunca repetiu a requisição (não há nada no PSP a menos que o teste o ponha).
+func abandoned(t *testing.T, e *env, id string) payment.ID {
+	t.Helper()
+	p, err := payment.New(payment.ID(id), payment.MerchantID(e.merchant), brl(t, 5000), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.payments.Insert(e.ctx, p, "k-"+id); err != nil {
+		t.Fatal(err)
+	}
+	return p.ID()
+}
+
+// O processo caiu DEPOIS de o PSP aprovar e ANTES de gravarmos. Sem reconciliação, ficaria
+// created para sempre com dinheiro autorizado no PSP.
+func TestResolveStuck_AbandonedCreated_PSPHadApproved_BecomesAuthorized(t *testing.T) {
+	e := setup(t)
+	id := abandoned(t, e, "pay_ab1")
+	e.psp.auths[string(id)] = "auth_9"
+
+	status, err := e.resolve.Execute(e.ctx, id)
+	if err != nil || status != payment.StatusAuthorized {
+		t.Fatalf("status=%s err=%v, want authorized", status, err)
+	}
+	if got := e.load(t, string(id)).PSPReference(); got != "auth_9" {
+		t.Errorf("psp_reference = %q", got)
+	}
+	if got := e.eventTypes(t); len(got) != 1 || got[0] != "payment.authorized" {
+		t.Errorf("eventos = %v, want [payment.authorized]", got)
+	}
+}
+
+// O PSP nunca recebeu: só depois da carência o pagamento abandonado vira failed.
+func TestResolveStuck_AbandonedCreated_NeverReachedPSP_FailsOnlyAfterGrace(t *testing.T) {
+	e := setup(t)
+	id := abandoned(t, e, "pay_ab2")
+
+	e.advanceClock(testGrace - time.Second)
+	if status, err := e.resolve.Execute(e.ctx, id); err != nil || status != payment.StatusCreated {
+		t.Fatalf("dentro da carência: status=%s err=%v, want created", status, err)
+	}
+	e.advanceClock(2 * time.Second)
+	if status, err := e.resolve.Execute(e.ctx, id); err != nil || status != payment.StatusFailed {
+		t.Fatalf("depois da carência: status=%s err=%v, want failed", status, err)
+	}
+	if got := e.load(t, string(id)).FailureReason(); got != usecase.ReasonPSPNeverReceived {
+		t.Errorf("failure_reason = %q", got)
+	}
+}
+
+// Depois de a reconciliação resolver, o cliente que finalmente repete a requisição recebe o
+// desfecho real (a chave estava parada em payment_created; o create só avança o ponto).
+func TestResolveStuck_ThenClientRetry_GetsTheReconciledOutcome(t *testing.T) {
+	e := setup(t)
+	keys := &faultyKeys{Store: e.keys.Store}
+	keys.failAdvanceN.Store(2) // cai ao avançar para psp_resolved, depois de o PSP aprovar
+	create := usecase.NewCreatePayment(postgres.NewTxManager(e.pool), e.payments, keys, e.psp, e.events(),
+		func() payment.ID { return "pay_retry" }, func() time.Time { return t0 })
+
+	if _, err := create.Execute(e.ctx, e.in("retry-key", 5000)); err == nil {
+		t.Fatal("esperava a falha injetada")
+	}
+	// A transação da fase 2 desfez: o PSP autorizou, mas aqui o pagamento segue created.
+	if got := e.load(t, "pay_retry").Status(); got != payment.StatusCreated {
+		t.Fatalf("preparação: status = %s, want created", got)
+	}
+	if status, err := e.resolve.Execute(e.ctx, "pay_retry"); err != nil || status != payment.StatusAuthorized {
+		t.Fatalf("status=%s err=%v, want authorized", status, err)
+	}
+
+	e.expireLease(t, "retry-key")
+	out, err := create.Execute(e.ctx, e.in("retry-key", 5000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Payment.Status != "authorized" {
+		t.Errorf("status no retry = %q, want authorized", out.Payment.Status)
+	}
+	if e.count(t, "payments") != 1 {
+		t.Errorf("payments = %d, want 1", e.count(t, "payments"))
+	}
+	if _, _, auths, _ := e.psp.stats(); auths != 1 {
+		t.Errorf("autorizações no PSP = %d, want 1", auths)
 	}
 }

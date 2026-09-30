@@ -12,9 +12,13 @@ import (
 // ReasonPSPNeverReceived: o PSP não conhece a tentativa, depois do período de carência.
 const ReasonPSPNeverReceived = "psp_never_received"
 
-// ResolveUnknown descobre o desfecho de um pagamento em estado unknown perguntando ao PSP.
-// É a peça central da reconciliação (o job que a chama periodicamente vem no passo 7).
-type ResolveUnknown struct {
+// ResolveStuck descobre o desfecho de um pagamento preso perguntando ao PSP. Dois casos:
+//   - unknown: o PSP não respondeu e não sabemos se autorizou;
+//   - created parado: o processo caiu depois de gravar o pagamento e antes de ter um desfecho,
+//     e o cliente nunca repetiu a requisição.
+//
+// É a peça central da reconciliação: o Reconciler (internal/worker) a chama periodicamente.
+type ResolveStuck struct {
 	tx       TxRunner
 	payments payment.Repository
 	gateway  psp.Gateway
@@ -26,26 +30,28 @@ type ResolveUnknown struct {
 // grace: quanto esperar antes de concluir "o PSP nunca recebeu". Um PSP pode estar com a
 // requisição numa fila; concluir cedo demais transformaria uma aprovação tardia em dinheiro
 // retido de um pagamento que já demos como falho.
-func NewResolveUnknown(tx TxRunner, payments payment.Repository, gateway psp.Gateway, events *EventRecorder,
-	grace time.Duration, now func() time.Time) *ResolveUnknown {
-	return &ResolveUnknown{tx: tx, payments: payments, gateway: gateway, events: events, grace: grace, now: now}
+func NewResolveStuck(tx TxRunner, payments payment.Repository, gateway psp.Gateway, events *EventRecorder,
+	grace time.Duration, now func() time.Time) *ResolveStuck {
+	return &ResolveStuck{tx: tx, payments: payments, gateway: gateway, events: events, grace: grace, now: now}
 }
 
-// Execute é idempotente e seguro de rodar em paralelo: só age se o pagamento AINDA for
-// unknown, e a gravação usa lock otimista (dois reconciliadores não se sobrescrevem).
-// Devolve o status depois da tentativa (pode continuar unknown).
-func (uc *ResolveUnknown) Execute(ctx context.Context, id payment.ID) (payment.Status, error) {
+// Execute é idempotente e seguro de rodar em paralelo: só age se o pagamento AINDA estiver
+// preso (created ou unknown), e a gravação usa lock otimista (dois reconciliadores, ou um
+// reconciliador e uma requisição viva, não se sobrescrevem). Devolve o status depois da
+// tentativa (pode continuar preso).
+func (uc *ResolveStuck) Execute(ctx context.Context, id payment.ID) (payment.Status, error) {
 	p, err := uc.payments.GetByID(ctx, id)
 	if err != nil {
 		return "", err
 	}
-	if p.Status() != payment.StatusUnknown {
+	if p.Status() != payment.StatusUnknown && p.Status() != payment.StatusCreated {
 		return p.Status(), nil // já resolvido por outro caminho
 	}
 
+	stuck := p.Status()
 	res, err := uc.gateway.Lookup(ctx, string(p.ID()))
 	if err != nil {
-		return payment.StatusUnknown, err // PSP fora do ar agora: tenta na próxima rodada
+		return stuck, err // PSP fora do ar agora: tenta na próxima rodada
 	}
 
 	now := uc.now()
@@ -56,11 +62,11 @@ func (uc *ResolveUnknown) Execute(ctx context.Context, id payment.ID) (payment.S
 		err = p.Fail(res.DeclineCode, now)
 	case psp.OutcomeNotFound:
 		if now.Sub(p.UpdatedAt()) < uc.grace {
-			return payment.StatusUnknown, nil // cedo demais para concluir
+			return stuck, nil // cedo demais para concluir
 		}
 		err = p.Fail(ReasonPSPNeverReceived, now)
 	default:
-		return payment.StatusUnknown, errors.New("desfecho de lookup desconhecido: " + string(res.Outcome))
+		return stuck, errors.New("desfecho de lookup desconhecido: " + string(res.Outcome))
 	}
 	if err != nil {
 		return "", err
