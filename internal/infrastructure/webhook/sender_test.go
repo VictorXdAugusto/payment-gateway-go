@@ -30,6 +30,12 @@ func TestIsPublicIP(t *testing.T) {
 		{"127.255.255.254", false},
 		{"::1", false},
 		{"::ffff:127.0.0.1", false}, // loopback disfarçado de IPv6
+		// netip.Prefix.Contains NÃO casa IPv4-mapeado com prefixo IPv4: sem Unmap() estes escapariam.
+		{"::ffff:100.64.0.1", false},
+		{"::ffff:198.18.0.1", false},
+		{"::ffff:240.0.0.1", false},
+		{"::ffff:0.1.2.3", false},
+		{"::ffff:8.8.8.8", true},
 		{"10.0.0.5", false},
 		{"172.16.0.1", false},
 		{"172.31.255.255", false},

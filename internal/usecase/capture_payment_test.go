@@ -171,6 +171,7 @@ func TestCapture_PSPDeclines_LeavesThePaymentAuthorized(t *testing.T) {
 func TestCapture_LedgerFailure_RollsBackThePaymentUpdate(t *testing.T) {
 	e := setup(t)
 	id := e.created(t, "create-1", 10000)
+	eventsBefore := e.count(t, "outbox_events")
 	e.ledger.fail.Store(true)
 
 	if _, err := e.capture.Execute(e.ctx, e.capIn(id, "cap-1")); !errors.Is(err, errInjected) {
@@ -180,6 +181,9 @@ func TestCapture_LedgerFailure_RollsBackThePaymentUpdate(t *testing.T) {
 		t.Fatalf("status = %s: o pagamento ficou capturado sem ledger", got)
 	}
 	e.assertLedger(t, 0, 0, 0)
+	if n := e.count(t, "outbox_events"); n != eventsBefore {
+		t.Fatalf("eventos = %d, want %d: o evento payment.captured vazou de uma transação desfeita", n, eventsBefore)
+	}
 
 	// O PSP JÁ capturou. O retry repete a captura (idempotente) e conclui os dois lados.
 	e.ledger.fail.Store(false)
@@ -196,16 +200,20 @@ func TestCapture_LedgerFailure_RollsBackThePaymentUpdate(t *testing.T) {
 func TestCapture_CrashBeforeFinish_CannotHappenWithoutTheRest(t *testing.T) {
 	e := setup(t)
 	id := e.created(t, "create-1", 10000)
+	eventsBefore := e.count(t, "outbox_events")
 	e.keys.failFinish.Store(1)
 
 	if _, err := e.capture.Execute(e.ctx, e.capIn(id, "cap-1")); !errors.Is(err, errInjected) {
 		t.Fatalf("err = %v", err)
 	}
-	// Finish está DENTRO da transação: se ele falha, o ledger e o pagamento desfazem juntos.
+	// Finish está DENTRO da transação: se ele falha, ledger, pagamento e evento desfazem juntos.
 	if got := e.load(t, id).Status(); got != payment.StatusAuthorized {
 		t.Fatalf("status = %s", got)
 	}
 	e.assertLedger(t, 0, 0, 0)
+	if n := e.count(t, "outbox_events"); n != eventsBefore {
+		t.Fatalf("eventos = %d, want %d: evento gravado fora da transação", n, eventsBefore)
+	}
 }
 
 // 20 requisições simultâneas com a MESMA chave: uma captura, o ledger lançado uma vez.
