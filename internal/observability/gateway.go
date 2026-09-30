@@ -35,6 +35,20 @@ func (g *InstrumentedGateway) Capture(ctx context.Context, req psp.CaptureReques
 	return err
 }
 
+func (g *InstrumentedGateway) Void(ctx context.Context, req psp.VoidRequest) error {
+	start := time.Now()
+	err := g.Gateway.Void(ctx, req)
+	g.m.PSPCall("void", pspOutcome(err), time.Since(start))
+	return err
+}
+
+func (g *InstrumentedGateway) Refund(ctx context.Context, req psp.RefundRequest) error {
+	start := time.Now()
+	err := g.Gateway.Refund(ctx, req)
+	g.m.PSPCall("refund", pspOutcome(err), time.Since(start))
+	return err
+}
+
 func (g *InstrumentedGateway) Lookup(ctx context.Context, key string) (psp.LookupResult, error) {
 	start := time.Now()
 	out, err := g.Gateway.Lookup(ctx, key)

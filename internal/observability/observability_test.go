@@ -73,6 +73,8 @@ func (f fakeGateway) Authorize(context.Context, psp.AuthorizeRequest) (psp.Autho
 	return psp.Authorization{Reference: "a1"}, f.authErr
 }
 func (f fakeGateway) Capture(context.Context, psp.CaptureRequest) error { return f.captureErr }
+func (f fakeGateway) Void(context.Context, psp.VoidRequest) error       { return f.captureErr }
+func (f fakeGateway) Refund(context.Context, psp.RefundRequest) error   { return f.captureErr }
 func (f fakeGateway) Lookup(context.Context, string) (psp.LookupResult, error) {
 	return psp.LookupResult{Outcome: psp.OutcomeAuthorized}, f.lookupErr
 }

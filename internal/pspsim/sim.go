@@ -23,6 +23,9 @@ const (
 	AmountCaptureFlaky  int64 = 6000 // autoriza normal; a 1ª tentativa de captura dá 503
 	AmountCaptureDeclin int64 = 6001 // autoriza normal; a captura é recusada (402)
 	AmountCaptureDown   int64 = 6002 // autoriza normal; a captura dá sempre 503 e nunca acontece
+	AmountVoidDown      int64 = 6003 // autoriza normal; o cancelamento dá sempre 503 e nunca acontece
+	AmountRefundFlaky   int64 = 6004 // captura normal; a 1ª tentativa de estorno dá 503
+	AmountRefundDown    int64 = 6005 // captura normal; o estorno dá sempre 503 e nunca acontece
 )
 
 type record struct {
@@ -34,6 +37,8 @@ type authorization struct {
 	ID       string
 	Amount   int64
 	Captured bool
+	Voided   bool
+	Refunded int64 // soma dos estornos aceitos
 }
 
 type Simulator struct {
@@ -61,6 +66,8 @@ func (s *Simulator) Handler() http.Handler {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("POST /v1/authorizations", s.authorize)
 	mux.HandleFunc("POST /v1/authorizations/{id}/capture", s.capture)
+	mux.HandleFunc("POST /v1/authorizations/{id}/void", s.void)
+	mux.HandleFunc("POST /v1/authorizations/{id}/refund", s.refund)
 	mux.HandleFunc("GET /v1/authorizations", s.lookup)
 	return mux
 }
@@ -169,12 +176,92 @@ func (s *Simulator) capture(w http.ResponseWriter, r *http.Request) {
 	case a.Amount == AmountCaptureDeclin:
 		writeRaw(w, s.save(key, 402, errBody("capture_declined", "captura recusada")))
 		return
+	case a.Voided:
+		writeRaw(w, s.save(key, 402, errBody("already_voided", "autorização cancelada")))
+		return
 	case req.Amount != a.Amount:
 		writeRaw(w, s.save(key, 422, errBody("amount_mismatch", "valor diferente do autorizado")))
 		return
 	}
 	a.Captured = true
 	writeRaw(w, s.save(key, 200, map[string]string{"id": a.ID, "status": "captured"}))
+}
+
+// void cancela uma autorização não capturada. Uma captura já feita não pode ser cancelada
+// (só estornada): o PSP recusa com 402 definitivo.
+func (s *Simulator) void(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		write(w, 400, errBody("bad_request", "Idempotency-Key é obrigatório"))
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.responses[key]; ok {
+		writeRaw(w, rec)
+		return
+	}
+	a, ok := s.auths[r.PathValue("id")]
+	if !ok {
+		write(w, 404, errBody("not_found", "autorização inexistente"))
+		return
+	}
+	s.attempt(key)
+
+	switch {
+	case a.Amount == AmountVoidDown:
+		write(w, 503, errBody("unavailable", "PSP indisponível"))
+		return
+	case a.Captured:
+		writeRaw(w, s.save(key, 402, errBody("already_captured", "autorização já capturada")))
+		return
+	}
+	a.Voided = true
+	writeRaw(w, s.save(key, 200, map[string]string{"id": a.ID, "status": "voided"}))
+}
+
+// refund devolve dinheiro de uma captura. O PSP impõe o limite: a soma dos estornos nunca
+// passa do valor capturado, mesmo que o chamador erre a conta (defesa em profundidade).
+func (s *Simulator) refund(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	var req struct {
+		Amount int64 `json:"amount"`
+	}
+	if key == "" || json.NewDecoder(r.Body).Decode(&req) != nil || req.Amount <= 0 {
+		write(w, 400, errBody("bad_request", "Idempotency-Key e amount positivo são obrigatórios"))
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.responses[key]; ok {
+		writeRaw(w, rec)
+		return
+	}
+	a, ok := s.auths[r.PathValue("id")]
+	if !ok {
+		write(w, 404, errBody("not_found", "autorização inexistente"))
+		return
+	}
+	n := s.attempt(key)
+
+	switch {
+	case a.Amount == AmountRefundDown:
+		write(w, 503, errBody("unavailable", "PSP indisponível"))
+		return
+	case a.Amount == AmountRefundFlaky && n == 1:
+		write(w, 503, errBody("unavailable", "PSP instável"))
+		return
+	case !a.Captured:
+		writeRaw(w, s.save(key, 402, errBody("not_captured", "autorização não capturada")))
+		return
+	case a.Refunded+req.Amount > a.Amount:
+		writeRaw(w, s.save(key, 402, errBody("refund_exceeds_captured", "estorno acima do valor capturado")))
+		return
+	}
+	a.Refunded += req.Amount
+	writeRaw(w, s.save(key, 200, map[string]any{"id": a.ID, "status": "refunded", "refunded": a.Refunded}))
 }
 
 func (s *Simulator) lookup(w http.ResponseWriter, r *http.Request) {
@@ -234,5 +321,8 @@ func Describe() string {
 		fmt.Sprintf("%d=captura instável", AmountCaptureFlaky),
 		fmt.Sprintf("%d=captura recusada", AmountCaptureDeclin),
 		fmt.Sprintf("%d=captura fora do ar", AmountCaptureDown),
+		fmt.Sprintf("%d=cancelamento fora do ar", AmountVoidDown),
+		fmt.Sprintf("%d=estorno instável", AmountRefundFlaky),
+		fmt.Sprintf("%d=estorno fora do ar", AmountRefundDown),
 	}, ", ")
 }

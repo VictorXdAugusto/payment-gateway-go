@@ -335,3 +335,108 @@ func TestAuthorize_CancellationOnTheLastAttempt_IsNotIndeterminate(t *testing.T)
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestSimulator_Void(t *testing.T) {
+	c, _ := simClient(t)
+	ctx := context.Background()
+
+	t.Run("cancela e é idempotente", func(t *testing.T) {
+		a, _ := authorize(c, "pay_v1", 1000, t)
+		req := domain.VoidRequest{IdempotencyKey: "void:pay_v1", Reference: a.Reference}
+		if err := c.Void(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Void(ctx, req); err != nil {
+			t.Fatalf("repetir o cancelamento com a mesma chave tem que ser seguro: %v", err)
+		}
+	})
+	t.Run("capturada não cancela: recusa definitiva", func(t *testing.T) {
+		a, _ := authorize(c, "pay_v2", 1000, t)
+		if err := c.Capture(ctx, domain.CaptureRequest{IdempotencyKey: "capture:pay_v2", Reference: a.Reference, Amount: brl(t, 1000)}); err != nil {
+			t.Fatal(err)
+		}
+		err := c.Void(ctx, domain.VoidRequest{IdempotencyKey: "void:pay_v2", Reference: a.Reference})
+		var declined *domain.DeclinedError
+		if !errors.As(err, &declined) || declined.Code != "already_captured" {
+			t.Fatalf("err = %v, want recusa already_captured", err)
+		}
+	})
+	t.Run("depois de cancelada, captura é recusada", func(t *testing.T) {
+		a, _ := authorize(c, "pay_v3", 1000, t)
+		if err := c.Void(ctx, domain.VoidRequest{IdempotencyKey: "void:pay_v3", Reference: a.Reference}); err != nil {
+			t.Fatal(err)
+		}
+		err := c.Capture(ctx, domain.CaptureRequest{IdempotencyKey: "capture:pay_v3", Reference: a.Reference, Amount: brl(t, 1000)})
+		if !errors.Is(err, domain.ErrDeclined) {
+			t.Fatalf("err = %v, want recusa", err)
+		}
+	})
+	t.Run("PSP fora do ar: indeterminado", func(t *testing.T) {
+		a, _ := authorize(c, "pay_v4", pspsim.AmountVoidDown, t)
+		err := c.Void(ctx, domain.VoidRequest{IdempotencyKey: "void:pay_v4", Reference: a.Reference})
+		if !errors.Is(err, domain.ErrIndeterminate) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestSimulator_Refund(t *testing.T) {
+	c, sim := simClient(t)
+	ctx := context.Background()
+	captured := func(key string, cents int64) domain.Authorization {
+		a, err := authorize(c, key, cents, t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Capture(ctx, domain.CaptureRequest{IdempotencyKey: "capture:" + key, Reference: a.Reference, Amount: brl(t, cents)}); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	refund := func(a domain.Authorization, key string, cents int64) error {
+		return c.Refund(ctx, domain.RefundRequest{IdempotencyKey: key, Reference: a.Reference, Amount: brl(t, cents)})
+	}
+
+	t.Run("parcial, idempotente e sem passar do capturado", func(t *testing.T) {
+		a := captured("pay_r1", 1000)
+		if err := refund(a, "refund:1", 400); err != nil {
+			t.Fatal(err)
+		}
+		if err := refund(a, "refund:1", 400); err != nil { // retry: não devolve 2x
+			t.Fatal(err)
+		}
+		if err := refund(a, "refund:2", 600); err != nil { // 400 + 600 = 1000: exatamente o capturado
+			t.Fatal(err)
+		}
+		err := refund(a, "refund:3", 1) // 1000 + 1: o PSP impõe o limite
+		var declined *domain.DeclinedError
+		if !errors.As(err, &declined) || declined.Code != "refund_exceeds_captured" {
+			t.Fatalf("err = %v, want refund_exceeds_captured (o retry não pode ter somado 2x)", err)
+		}
+	})
+	t.Run("não capturada não estorna", func(t *testing.T) {
+		a, _ := authorize(c, "pay_r2", 1000, t)
+		if err := refund(a, "refund:x", 100); !errors.Is(err, domain.ErrDeclined) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("instável resolve por retry", func(t *testing.T) {
+		a := captured("pay_r3", pspsim.AmountRefundFlaky)
+		if err := refund(a, "refund:f", 100); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("fora do ar: indeterminado", func(t *testing.T) {
+		a := captured("pay_r4", pspsim.AmountRefundDown)
+		if err := refund(a, "refund:d", 100); !errors.Is(err, domain.ErrIndeterminate) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("autorização inexistente é erro de contrato, não recusa", func(t *testing.T) {
+		err := c.Refund(ctx, domain.RefundRequest{IdempotencyKey: "refund:n", Reference: "auth_nao_existe", Amount: brl(t, 100)})
+		if err == nil || errors.Is(err, domain.ErrDeclined) || errors.Is(err, domain.ErrIndeterminate) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	_ = sim
+}

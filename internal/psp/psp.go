@@ -46,6 +46,17 @@ type CaptureRequest struct {
 	Amount         money.Money
 }
 
+type VoidRequest struct {
+	IdempotencyKey string
+	Reference      string
+}
+
+type RefundRequest struct {
+	IdempotencyKey string // estável por estorno: repetir a chamada nunca devolve o dinheiro duas vezes
+	Reference      string
+	Amount         money.Money
+}
+
 type Outcome string
 
 const (
@@ -67,6 +78,12 @@ type Gateway interface {
 
 	// Capture efetiva uma autorização. Mesmos erros de Authorize.
 	Capture(ctx context.Context, req CaptureRequest) error
+
+	// Void cancela uma autorização ainda não capturada. Mesmos erros de Authorize.
+	Void(ctx context.Context, req VoidRequest) error
+
+	// Refund devolve parte ou todo o valor de uma captura. Mesmos erros de Authorize.
+	Refund(ctx context.Context, req RefundRequest) error
 
 	// Lookup pergunta ao PSP o que ele sabe sobre uma chave. Só lê, nunca causa efeito.
 	Lookup(ctx context.Context, idempotencyKey string) (LookupResult, error)

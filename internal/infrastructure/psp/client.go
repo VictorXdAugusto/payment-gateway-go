@@ -74,6 +74,24 @@ func (c *Client) Capture(ctx context.Context, req domain.CaptureRequest) error {
 	return interpret(status, body, nil)
 }
 
+func (c *Client) Void(ctx context.Context, req domain.VoidRequest) error {
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/authorizations/"+url.PathEscape(req.Reference)+"/void",
+		req.IdempotencyKey, map[string]any{})
+	if err != nil {
+		return err
+	}
+	return interpret(status, body, nil)
+}
+
+func (c *Client) Refund(ctx context.Context, req domain.RefundRequest) error {
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/authorizations/"+url.PathEscape(req.Reference)+"/refund",
+		req.IdempotencyKey, map[string]any{"amount": req.Amount.Amount()})
+	if err != nil {
+		return err
+	}
+	return interpret(status, body, nil)
+}
+
 func (c *Client) Lookup(ctx context.Context, key string) (domain.LookupResult, error) {
 	status, body, err := c.do(ctx, http.MethodGet, "/v1/authorizations?idempotency_key="+url.QueryEscape(key), "", nil)
 	if err != nil {
