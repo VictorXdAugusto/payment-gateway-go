@@ -118,3 +118,63 @@ func parseLevel(s string) (slog.Level, error) {
 	}
 	return l, nil
 }
+
+// WorkerConfig é a configuração do processo de entrega de webhooks (cmd/worker).
+type WorkerConfig struct {
+	DatabaseURL string
+	LogLevel    slog.Level
+
+	BatchSize    int
+	Concurrency  int
+	PollInterval time.Duration
+	Lease        time.Duration // deve ser MAIOR que o timeout de uma entrega
+	MaxAttempts  int
+	BaseBackoff  time.Duration
+	MaxBackoff   time.Duration
+
+	DeliveryTimeout time.Duration
+	// AllowPrivate desliga a proteção contra SSRF. SÓ desenvolvimento.
+	AllowPrivate bool
+}
+
+func LoadWorker() (WorkerConfig, error) {
+	c := WorkerConfig{DatabaseURL: os.Getenv("DATABASE_URL")}
+	if c.DatabaseURL == "" {
+		return WorkerConfig{}, errors.New("DATABASE_URL é obrigatória")
+	}
+	var err error
+	if c.LogLevel, err = parseLevel(getEnv("LOG_LEVEL", "info")); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.PollInterval, err = envDuration("WEBHOOK_POLL_INTERVAL", "500ms"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.Lease, err = envDuration("WEBHOOK_LEASE", "60s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.BaseBackoff, err = envDuration("WEBHOOK_BASE_BACKOFF", "10s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.MaxBackoff, err = envDuration("WEBHOOK_MAX_BACKOFF", "1h"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.DeliveryTimeout, err = envDuration("WEBHOOK_TIMEOUT", "5s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.BatchSize, err = envInt("WEBHOOK_BATCH", 20, 1, 500); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.Concurrency, err = envInt("WEBHOOK_CONCURRENCY", 8, 1, 200); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.MaxAttempts, err = envInt("WEBHOOK_MAX_ATTEMPTS", 10, 1, 100); err != nil {
+		return WorkerConfig{}, err
+	}
+	c.AllowPrivate = getEnv("WEBHOOK_ALLOW_PRIVATE", "false") == "true"
+
+	// Se o lease fosse menor que o timeout, outro worker reassumiria uma entrega AINDA em curso.
+	if c.Lease <= c.DeliveryTimeout {
+		return WorkerConfig{}, fmt.Errorf("WEBHOOK_LEASE (%s) deve ser maior que WEBHOOK_TIMEOUT (%s)", c.Lease, c.DeliveryTimeout)
+	}
+	return c, nil
+}
