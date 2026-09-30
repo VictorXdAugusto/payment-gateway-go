@@ -59,28 +59,9 @@ func (uc *CapturePayment) Execute(ctx context.Context, in CapturePaymentInput) (
 	if err := idempotency.ValidateKey(in.IdempotencyKey); err != nil {
 		return CreatePaymentOutput{}, err
 	}
-
 	hash := idempotency.Fingerprint("capture_payment", in.PaymentID)
-	acq, err := uc.keys.Acquire(ctx, idempotency.Key{MerchantID: in.MerchantID, Value: in.IdempotencyKey}, hash)
-	if err != nil {
-		return CreatePaymentOutput{}, err
-	}
-	if acq.Replay != nil {
-		var view PaymentView
-		if err := json.Unmarshal(acq.Replay, &view); err != nil {
-			return CreatePaymentOutput{}, fmt.Errorf("resposta guardada corrompida: %w", err)
-		}
-		return CreatePaymentOutput{Payment: view, Replayed: true}, nil
-	}
-
-	view, err := uc.run(ctx, acq, in)
-	if err != nil {
-		if !errors.Is(err, idempotency.ErrLockLost) {
-			_ = uc.keys.Release(context.WithoutCancel(ctx), acq)
-		}
-		return CreatePaymentOutput{}, err
-	}
-	return CreatePaymentOutput{Payment: view}, nil
+	return runIdempotent(ctx, uc.keys, in.MerchantID, in.IdempotencyKey, hash,
+		func(acq idempotency.Acquisition) (PaymentView, error) { return uc.run(ctx, acq, in) })
 }
 
 func (uc *CapturePayment) run(ctx context.Context, acq idempotency.Acquisition, in CapturePaymentInput) (PaymentView, error) {

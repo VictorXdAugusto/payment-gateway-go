@@ -45,15 +45,21 @@ type fakePSP struct {
 	auths    map[string]string // idempotency key -> referência
 	declined map[string]string // idempotency key -> código
 	captured map[string]bool   // idempotency key da captura
+	voided   map[string]bool   // idempotency key do cancelamento
+	refunded map[string]int64  // idempotency key do estorno -> valor (estorno idempotente)
 	modes    []authMode        // roteiro consumido a cada NOVA autorização (vazio = aprova)
 
 	authorizeCalls, captureCalls, lookupCalls int
+	voidCalls, refundCalls                    int
 	captureErrs                               []error // roteiro da captura; nil = sucesso
+	voidErrs, refundErrs                      []error // roteiros do cancelamento e do estorno
+	voidHappenedThenTimeout                   bool    // o PSP cancela MAS a resposta se perde (o caso perigoso)
 	lookupErr                                 error
 }
 
 func newFakePSP() *fakePSP {
-	return &fakePSP{auths: map[string]string{}, declined: map[string]string{}, captured: map[string]bool{}}
+	return &fakePSP{auths: map[string]string{}, declined: map[string]string{}, captured: map[string]bool{},
+		voided: map[string]bool{}, refunded: map[string]int64{}}
 }
 
 func (f *fakePSP) script(m ...authMode) { f.mu.Lock(); f.modes = m; f.mu.Unlock() }
@@ -121,6 +127,75 @@ func (f *fakePSP) Capture(_ context.Context, req psp.CaptureRequest) error {
 		}
 	}
 	f.captured[req.IdempotencyKey] = true
+	return nil
+}
+
+func (f *fakePSP) scriptVoid(errs ...error) { f.mu.Lock(); f.voidErrs = errs; f.mu.Unlock() }
+
+// scriptVoidHappenedThenTimeout: a próxima chamada de cancelamento acontece no PSP, mas o
+// chamador só vê um timeout.
+func (f *fakePSP) scriptVoidHappenedThenTimeout() {
+	f.mu.Lock()
+	f.voidHappenedThenTimeout = true
+	f.mu.Unlock()
+}
+
+func (f *fakePSP) scriptRefund(errs ...error) { f.mu.Lock(); f.refundErrs = errs; f.mu.Unlock() }
+
+// refundStats devolve as chamadas e quanto dinheiro foi REALMENTE devolvido (chaves distintas).
+func (f *fakePSP) refundStats() (calls int, distinct int, total int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range f.refunded {
+		total += v
+	}
+	return f.refundCalls, len(f.refunded), total
+}
+
+func (f *fakePSP) voidStats() (calls, distinct int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.voidCalls, len(f.voided)
+}
+
+func (f *fakePSP) Void(_ context.Context, req psp.VoidRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.voidCalls++
+	if f.voided[req.IdempotencyKey] {
+		return nil
+	}
+	if f.voidHappenedThenTimeout {
+		f.voidHappenedThenTimeout = false
+		f.voided[req.IdempotencyKey] = true
+		return fmt.Errorf("%w: timeout", psp.ErrIndeterminate)
+	}
+	if len(f.voidErrs) > 0 {
+		err := f.voidErrs[0]
+		f.voidErrs = f.voidErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
+	f.voided[req.IdempotencyKey] = true
+	return nil
+}
+
+func (f *fakePSP) Refund(_ context.Context, req psp.RefundRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refundCalls++
+	if _, ok := f.refunded[req.IdempotencyKey]; ok {
+		return nil
+	}
+	if len(f.refundErrs) > 0 {
+		err := f.refundErrs[0]
+		f.refundErrs = f.refundErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
+	f.refunded[req.IdempotencyKey] = req.Amount.Amount()
 	return nil
 }
 
@@ -213,6 +288,8 @@ type env struct {
 
 	create  *usecase.CreatePayment
 	capture *usecase.CapturePayment
+	void    *usecase.VoidPayment
+	refund  *usecase.RefundPayment
 	resolve *usecase.ResolveStuck
 
 	clock atomic.Int64 // unix nano do "agora" controlável
@@ -247,6 +324,8 @@ func setup(t *testing.T) *env {
 
 	e.create = usecase.NewCreatePayment(txm, e.payments, e.keys, e.psp, events, newPayID, now)
 	e.capture = usecase.NewCapturePayment(txm, e.payments, e.ledger, e.keys, e.psp, events, testFeeBps, newTxID, now)
+	e.void = usecase.NewVoidPayment(txm, e.payments, e.keys, e.psp, events, now)
+	e.refund = usecase.NewRefundPayment(txm, e.payments, e.ledger, e.keys, e.psp, events, newTxID, now)
 	e.resolve = usecase.NewResolveStuck(txm, e.payments, e.psp, events, testGrace, now)
 	return e
 }
