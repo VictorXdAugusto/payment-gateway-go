@@ -45,6 +45,38 @@ services:
       timeout: 2s
       retries: 10
 
+  # Entrega os eventos da outbox aos webhooks dos lojistas. Processo separado do servidor HTTP.
+  worker:
+    build: .
+    image: payment-gateway-go:local
+    entrypoint: ["worker"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL}
+      WEBHOOK_POLL_INTERVAL: "300ms"
+      WEBHOOK_BASE_BACKOFF: "2s"   # curto para o desenvolvimento; em produção, 10s+
+      WEBHOOK_MAX_BACKOFF: "30s"
+      WEBHOOK_MAX_ATTEMPTS: "6"
+      # O receptor de exemplo mora numa rede privada do Docker: sem isto o SSRF guard o bloquearia.
+      # NUNCA ligar em produção.
+      WEBHOOK_ALLOW_PRIVATE: "true"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Receptor de webhooks de REFERÊNCIA (só desenvolvimento): verifica a assinatura, deduplica
+  # pelo event_id e falha as 2 primeiras tentativas de cada evento para exercitar o retry.
+  webhook-sink:
+    build: .
+    image: payment-gateway-go:local
+    entrypoint: ["webhook-sink"]
+    environment:
+      SINK_SECRET: ${SINK_SECRET:-whsec_dev_secret}
+      SINK_FAIL_FIRST: "${SINK_FAIL_FIRST:-2}"
+    ports:
+      - "${SINK_HOST_PORT:-9101}:9100"
+
   app:
     build: .
     image: payment-gateway-go:local
