@@ -7,13 +7,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/config"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
 	httpiface "github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http/handler"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
 )
 
 func main() {
@@ -42,9 +47,21 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Composição: é aqui (e só aqui) que as peças concretas se conhecem.
+	txm := postgres.NewTxManager(pool)
+	payments := postgres.NewPaymentRepository(txm)
+	keys := postgres.NewIdempotencyStore(txm, cfg.IdempotencyLease)
+	newID := func() payment.ID { return payment.ID("pay_" + strings.ReplaceAll(uuid.NewString(), "-", "")) }
+
+	paymentHandler := handler.NewPayment(
+		usecase.NewCreatePayment(txm, payments, keys, newID, time.Now),
+		usecase.NewGetPayment(payments),
+	)
+
 	srv := &http.Server{
-		Addr:              ":" + cfg.HTTPPort,
-		Handler:           httpiface.NewRouter(handler.NewHealth(pool)),
+		Addr: ":" + cfg.HTTPPort,
+		Handler: httpiface.NewRouter(handler.NewHealth(pool), paymentHandler,
+			postgres.NewMerchantAuthenticator(pool)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
