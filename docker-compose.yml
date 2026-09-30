@@ -60,9 +60,18 @@ services:
       # O receptor de exemplo mora numa rede privada do Docker: sem isto o SSRF guard o bloquearia.
       # NUNCA ligar em produção.
       WEBHOOK_ALLOW_PRIVATE: "true"
+      # Reconciliação de pagamentos presos: consulta o PSP e resolve unknown e created parado.
+      PSP_BASE_URL: http://psp:9090
+      PSP_ATTEMPT_TIMEOUT: "1s"
+      PSP_MAX_ATTEMPTS: "3"
+      UNKNOWN_GRACE: "${UNKNOWN_GRACE:-20s}"      # curto para o desenvolvimento; em produção, minutos
+      RECONCILE_INTERVAL: "5s"
+      RECONCILE_STALE_AFTER: "10s"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      psp:
+        condition: service_healthy
     restart: unless-stopped
 
   # Receptor de webhooks de REFERÊNCIA (só desenvolvimento): verifica a assinatura, deduplica
