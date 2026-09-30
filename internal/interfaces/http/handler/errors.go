@@ -38,6 +38,17 @@ func writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusConflict, "idempotency_key_in_use",
 			"uma requisição com esta Idempotency-Key ainda está em processamento; tente novamente")
+	case errors.Is(err, payment.ErrInvalidTransition):
+		writeError(w, http.StatusConflict, "invalid_state", "o pagamento não está em um estado que permita esta operação")
+	case errors.Is(err, payment.ErrConcurrentModification):
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusConflict, "payment_conflict", "o pagamento foi alterado por outra operação; tente novamente")
+	case errors.Is(err, usecase.ErrPSPUnavailable):
+		w.Header().Set("Retry-After", "2")
+		writeError(w, http.StatusBadGateway, "psp_unavailable",
+			"o adquirente não confirmou a operação; repita a requisição com a mesma Idempotency-Key")
+	case errors.Is(err, usecase.ErrCaptureRejected):
+		writeError(w, http.StatusUnprocessableEntity, "capture_rejected", "o adquirente recusou a captura")
 	case errors.Is(err, payment.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "pagamento não encontrado")
 	default:

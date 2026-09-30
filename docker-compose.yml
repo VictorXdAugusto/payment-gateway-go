@@ -28,17 +28,41 @@ services:
       postgres:
         condition: service_healthy
 
+  # Adquirente FALSO (só desenvolvimento). Mesma imagem do app, outro binário.
+  # O valor do pagamento escolhe o comportamento: ver `make psp-help`.
+  psp:
+    build: .
+    image: payment-gateway-go:local
+    entrypoint: ["psp-simulator"]
+    environment:
+      PSP_PORT: "9090"
+      PSP_SLOW: "3s"
+    ports:
+      - "${PSP_HOST_PORT:-9091}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
   app:
     build: .
+    image: payment-gateway-go:local
     environment:
       HTTP_PORT: "8080"
       LOG_LEVEL: ${LOG_LEVEL}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      PSP_BASE_URL: http://psp:9090
+      PSP_ATTEMPT_TIMEOUT: "1s"   # menor que o PSP_SLOW do simulador, para exercitar o timeout
+      PSP_MAX_ATTEMPTS: "3"
+      PLATFORM_FEE_BPS: "290"
     ports:
       - "${APP_HOST_PORT}:8080"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      psp:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 5s

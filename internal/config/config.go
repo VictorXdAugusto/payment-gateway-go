@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +19,17 @@ type Config struct {
 	// IdempotencyLease: por quanto tempo uma requisição segura a chave antes de outra poder
 	// assumir. Deve ser maior que o pior caso de processamento de uma requisição.
 	IdempotencyLease time.Duration
+
+	PSPBaseURL        string
+	PSPAttemptTimeout time.Duration
+	PSPMaxAttempts    int
+	PSPBaseBackoff    time.Duration
+	PSPMaxBackoff     time.Duration
+
+	// PlatformFeeBps: taxa do gateway em basis points (290 = 2,90%).
+	PlatformFeeBps int64
+	// UnknownGrace: quanto esperar antes de concluir que o PSP nunca recebeu uma tentativa.
+	UnknownGrace time.Duration
 }
 
 // Load lê o ambiente e falha cedo se algo obrigatório estiver faltando.
@@ -34,6 +46,28 @@ func Load() (Config, error) {
 	}
 	cfg.IdempotencyLease = lease
 
+	cfg.PSPBaseURL = getEnv("PSP_BASE_URL", "http://localhost:9090")
+	if cfg.PSPAttemptTimeout, err = envDuration("PSP_ATTEMPT_TIMEOUT", "2s"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PSPBaseBackoff, err = envDuration("PSP_BASE_BACKOFF", "100ms"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PSPMaxBackoff, err = envDuration("PSP_MAX_BACKOFF", "1s"); err != nil {
+		return Config{}, err
+	}
+	if cfg.UnknownGrace, err = envDuration("UNKNOWN_GRACE", "2m"); err != nil {
+		return Config{}, err
+	}
+	if cfg.PSPMaxAttempts, err = envInt("PSP_MAX_ATTEMPTS", 3, 1, 10); err != nil {
+		return Config{}, err
+	}
+	fee, err := envInt("PLATFORM_FEE_BPS", 290, 0, 10000)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PlatformFeeBps = int64(fee)
+
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL é obrigatória")
 	}
@@ -45,6 +79,29 @@ func Load() (Config, error) {
 	cfg.LogLevel = level
 
 	return cfg, nil
+}
+
+func envDuration(key, fallback string) (time.Duration, error) {
+	d, err := time.ParseDuration(getEnv(key, fallback))
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s inválido: %q", key, os.Getenv(key))
+	}
+	return d, nil
+}
+
+func envInt(key string, fallback, min, max int) (int, error) {
+	v := fallback
+	if raw := os.Getenv(key); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, fmt.Errorf("%s inválido: %q", key, raw)
+		}
+		v = n
+	}
+	if v < min || v > max {
+		return 0, fmt.Errorf("%s fora do intervalo [%d, %d]: %d", key, min, max, v)
+	}
+	return v, nil
 }
 
 func getEnv(key, fallback string) string {

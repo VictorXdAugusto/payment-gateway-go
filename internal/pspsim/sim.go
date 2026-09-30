@@ -22,6 +22,7 @@ const (
 	AmountDown          int64 = 5003 // sempre 503 e nunca aprova
 	AmountCaptureFlaky  int64 = 6000 // autoriza normal; a 1ª tentativa de captura dá 503
 	AmountCaptureDeclin int64 = 6001 // autoriza normal; a captura é recusada (402)
+	AmountCaptureDown   int64 = 6002 // autoriza normal; a captura dá sempre 503 e nunca acontece
 )
 
 type record struct {
@@ -162,6 +163,9 @@ func (s *Simulator) capture(w http.ResponseWriter, r *http.Request) {
 	case a.Amount == AmountCaptureFlaky && n == 1:
 		write(w, 503, errBody("unavailable", "PSP instável"))
 		return
+	case a.Amount == AmountCaptureDown:
+		write(w, 503, errBody("unavailable", "PSP indisponível"))
+		return
 	case a.Amount == AmountCaptureDeclin:
 		writeRaw(w, s.save(key, 402, errBody("capture_declined", "captura recusada")))
 		return
@@ -229,5 +233,6 @@ func Describe() string {
 		fmt.Sprintf("%d=fora do ar", AmountDown),
 		fmt.Sprintf("%d=captura instável", AmountCaptureFlaky),
 		fmt.Sprintf("%d=captura recusada", AmountCaptureDeclin),
+		fmt.Sprintf("%d=captura fora do ar", AmountCaptureDown),
 	}, ", ")
 }

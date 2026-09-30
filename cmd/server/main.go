@@ -14,8 +14,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/config"
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/ledger"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/postgres"
+	pspclient "github.com/VictorXdAugusto/payment-gateway-go/internal/infrastructure/psp"
 	httpiface "github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/interfaces/http/handler"
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/usecase"
@@ -53,8 +55,21 @@ func run() error {
 	keys := postgres.NewIdempotencyStore(txm, cfg.IdempotencyLease)
 	newID := func() payment.ID { return payment.ID("pay_" + strings.ReplaceAll(uuid.NewString(), "-", "")) }
 
+	gateway := pspclient.New(pspclient.Config{
+		BaseURL:        cfg.PSPBaseURL,
+		AttemptTimeout: cfg.PSPAttemptTimeout,
+		MaxAttempts:    cfg.PSPMaxAttempts,
+		BaseBackoff:    cfg.PSPBaseBackoff,
+		MaxBackoff:     cfg.PSPMaxBackoff,
+	})
+	ledgerRepo := postgres.NewLedgerRepository(txm)
+	newLedgerTxID := func() ledger.TransactionID {
+		return ledger.TransactionID("ltx_" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	}
+
 	paymentHandler := handler.NewPayment(
-		usecase.NewCreatePayment(txm, payments, keys, newID, time.Now),
+		usecase.NewCreatePayment(txm, payments, keys, gateway, newID, time.Now),
+		usecase.NewCapturePayment(txm, payments, ledgerRepo, keys, gateway, cfg.PlatformFeeBps, newLedgerTxID, time.Now),
 		usecase.NewGetPayment(payments),
 	)
 

@@ -1,6 +1,6 @@
 COMPOSE ?= docker-compose
 
-.PHONY: up down logs test test-integration vet run migrate-down merchant
+.PHONY: up down logs test test-integration vet run migrate-down merchant psp-help
 
 up: ## Sobe tudo (banco, migrations, app)
 	$(COMPOSE) up -d --build
@@ -35,3 +35,7 @@ merchant: ## Cria um lojista e imprime a API key (aparece só esta vez): make me
 	  | $(COMPOSE) exec -T postgres psql -q -tA -U $$(grep POSTGRES_USER .env | cut -d= -f2) -d $$(grep POSTGRES_DB .env | cut -d= -f2) -v name="$(NAME)" -v key="$$key" \
 	  | sed 's/^/merchant_id: /'; \
 	echo "api_key:     $$key"
+
+psp-help: ## Valores (centavos) que fazem o PSP simulado se comportar de cada jeito
+	@echo "4000 recusa | 5000 lento mas APROVA (fica processing) | 5001 lento e perdido | 5002 instável (retry resolve)"
+	@echo "5003 fora do ar | 6000 captura instável (retry resolve) | 6001 captura recusada | 6002 captura fora do ar"

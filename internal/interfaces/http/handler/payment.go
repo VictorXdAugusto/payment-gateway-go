@@ -17,17 +17,22 @@ type CreatePaymentUseCase interface {
 	Execute(ctx context.Context, in usecase.CreatePaymentInput) (usecase.CreatePaymentOutput, error)
 }
 
+type CapturePaymentUseCase interface {
+	Execute(ctx context.Context, in usecase.CapturePaymentInput) (usecase.CreatePaymentOutput, error)
+}
+
 type GetPaymentUseCase interface {
 	Execute(ctx context.Context, merchantID, id string) (usecase.PaymentView, error)
 }
 
 type Payment struct {
-	create CreatePaymentUseCase
-	get    GetPaymentUseCase
+	create  CreatePaymentUseCase
+	capture CapturePaymentUseCase
+	get     GetPaymentUseCase
 }
 
-func NewPayment(create CreatePaymentUseCase, get GetPaymentUseCase) *Payment {
-	return &Payment{create: create, get: get}
+func NewPayment(create CreatePaymentUseCase, capture CapturePaymentUseCase, get GetPaymentUseCase) *Payment {
+	return &Payment{create: create, capture: capture, get: get}
 }
 
 type createPaymentRequest struct {
@@ -68,6 +73,30 @@ func (h *Payment) Create(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replayed", "true")
 	}
 	writeJSON(w, http.StatusCreated, out.Payment)
+}
+
+// Capture: POST /v1/payments/{id}/capture  (header Idempotency-Key obrigatório, sem corpo)
+func (h *Payment) Capture(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "o header Idempotency-Key é obrigatório")
+		return
+	}
+
+	out, err := h.capture.Execute(r.Context(), usecase.CapturePaymentInput{
+		MerchantID:     middleware.MerchantID(r.Context()),
+		PaymentID:      r.PathValue("id"),
+		IdempotencyKey: key,
+	})
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+
+	if out.Replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeJSON(w, http.StatusOK, out.Payment)
 }
 
 // Get: GET /v1/payments/{id}

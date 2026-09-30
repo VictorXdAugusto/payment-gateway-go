@@ -18,6 +18,7 @@ func NewRouter(health *handler.Health, payments *handler.Payment, auth middlewar
 
 	authed := middleware.Auth(auth)
 	mux.Handle("POST /v1/payments", authed(http.HandlerFunc(payments.Create)))
+	mux.Handle("POST /v1/payments/{id}/capture", authed(http.HandlerFunc(payments.Capture)))
 	mux.Handle("GET /v1/payments/{id}", authed(http.HandlerFunc(payments.Get)))
 
 	return middleware.Observe(mux)
