@@ -9,9 +9,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/auth"
 )
 
-var ErrUnauthorized = errors.New("api key inválida")
+// ErrUnauthorized é o sentinela compartilhado (internal/auth): a borda HTTP o reconhece.
+var ErrUnauthorized = auth.ErrUnauthorized
 
 // MerchantAuthenticator troca uma API key pelo id do lojista.
 // O banco guarda só o SHA-256 da key: um vazamento do banco não entrega credenciais.

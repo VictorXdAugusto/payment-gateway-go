@@ -3,12 +3,15 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/VictorXdAugusto/payment-gateway-go/internal/auth"
 )
 
 type ctxKey int
@@ -24,7 +27,8 @@ func MerchantID(ctx context.Context) string {
 	return v
 }
 
-// Authenticator troca uma API key pelo id do lojista.
+// Authenticator troca uma API key pelo id do lojista. Deve devolver auth.ErrUnauthorized para
+// credencial inválida; qualquer outro erro é tratado como indisponibilidade (503).
 type Authenticator interface {
 	Authenticate(ctx context.Context, apiKey string) (string, error)
 }
@@ -39,8 +43,16 @@ func Auth(a Authenticator) func(http.Handler) http.Handler {
 				return
 			}
 			merchantID, err := a.Authenticate(r.Context(), token)
-			if err != nil {
+			switch {
+			case errors.Is(err, auth.ErrUnauthorized):
 				unauthorized(w)
+				return
+			case err != nil:
+				slog.ErrorContext(r.Context(), "falha ao autenticar", "error", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":{"code":"auth_unavailable","message":"não foi possível validar a credencial agora; tente novamente"}}` + "\n"))
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), merchantKey, merchantID)))

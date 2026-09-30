@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -31,7 +32,12 @@ type TxManager struct {
 
 func NewTxManager(pool *pgxpool.Pool) *TxManager { return &TxManager{pool: pool} }
 
-// WithinTx roda fn numa transação: commit se fn devolver nil, rollback caso contrário.
+// rollbackTimeout limita o rollback: sem prazo, uma conexão travada seguraria a goroutine e a
+// conexão do pool para sempre.
+const rollbackTimeout = 5 * time.Second
+
+// WithinTx roda fn numa transação: commit se fn devolver nil, rollback caso contrário (inclusive
+// se fn entrar em pânico: o pânico segue subindo, mas a conexão volta ao pool limpa).
 // Se o ctx já carrega uma transação, fn apenas participa dela (quem abriu é quem comita).
 func (m *TxManager) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
@@ -43,9 +49,22 @@ func (m *TxManager) WithinTx(ctx context.Context, fn func(ctx context.Context) e
 		return fmt.Errorf("begin: %w", err)
 	}
 
+	rollback := func() {
+		// Contexto próprio (se ctx foi cancelado ainda precisamos desfazer), mas com prazo.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rctx)
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			rollback()
+			panic(p)
+		}
+	}()
+
 	if err := fn(context.WithValue(ctx, txKey{}, tx)); err != nil {
-		// Rollback com contexto próprio: se ctx foi cancelado, ainda precisamos desfazer.
-		_ = tx.Rollback(context.WithoutCancel(ctx))
+		rollback()
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
