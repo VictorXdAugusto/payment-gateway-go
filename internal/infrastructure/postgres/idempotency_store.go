@@ -142,13 +142,17 @@ func (s *IdempotencyStore) Release(ctx context.Context, a idempotency.Acquisitio
 	return nil
 }
 
-// PurgeOlderThan apaga chaves antigas (a Stripe guarda 24h). Só apaga chaves TERMINADAS:
-// uma em andamento nunca é removida por baixo de quem a processa.
-func (s *IdempotencyStore) PurgeOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+// Purge apaga chaves antigas (a Stripe guarda 24h), no máximo limit por chamada. Só apaga
+// chaves TERMINADAS: uma em andamento nunca é removida por baixo de quem a processa.
+func (s *IdempotencyStore) Purge(ctx context.Context, age time.Duration, limit int) (int64, error) {
 	tag, err := s.tx.DB(ctx).Exec(ctx, `
 		DELETE FROM idempotency_keys
-		 WHERE recovery_point = $1 AND created_at < now() - make_interval(secs => $2::float8)`,
-		idempotency.PointFinished, age.Seconds())
+		 WHERE (merchant_id, key) IN (
+		       SELECT merchant_id, key FROM idempotency_keys
+		        WHERE recovery_point = $1 AND created_at < now() - make_interval(secs => $2::float8)
+		        ORDER BY created_at
+		        LIMIT $3)`,
+		idempotency.PointFinished, age.Seconds(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("limpar chaves: %w", err)
 	}

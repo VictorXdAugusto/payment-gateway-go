@@ -110,3 +110,21 @@ func (r *OutboxRepository) finish(ctx context.Context, sql string, d outbox.Deli
 	}
 	return nil
 }
+
+// Purge apaga eventos já entregues ou dispensados há mais que olderThan (relógio do banco).
+// Eventos dead e pendentes nunca são apagados: um está esperando inspeção, o outro entrega.
+// Apaga no máximo limit por chamada, para não segurar um lock longo na tabela.
+func (r *OutboxRepository) Purge(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	tag, err := r.tx.DB(ctx).Exec(ctx, `
+		DELETE FROM outbox_events
+		 WHERE id IN (
+		       SELECT id FROM outbox_events
+		        WHERE status IN ('delivered', 'skipped')
+		          AND created_at < now() - make_interval(secs => $1::float8)
+		        ORDER BY created_at
+		        LIMIT $2)`, olderThan.Seconds(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("limpar outbox: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}

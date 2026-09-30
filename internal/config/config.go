@@ -135,6 +135,24 @@ type WorkerConfig struct {
 	DeliveryTimeout time.Duration
 	// AllowPrivate desliga a proteção contra SSRF. SÓ desenvolvimento.
 	AllowPrivate bool
+
+	// Reconciliação de pagamentos presos (unknown e created parado).
+	PSPBaseURL          string
+	PSPAttemptTimeout   time.Duration
+	PSPMaxAttempts      int
+	PSPBaseBackoff      time.Duration
+	PSPMaxBackoff       time.Duration
+	UnknownGrace        time.Duration
+	ReconcileInterval   time.Duration
+	ReconcileStaleAfter time.Duration
+	ReconcilePageSize   int
+	ReconcileMaxErrors  int
+
+	// Retenção: quanto tempo guardar o que já não serve para operar.
+	RetentionInterval    time.Duration
+	RetentionBatch       int
+	IdempotencyRetention time.Duration
+	OutboxRetention      time.Duration
 }
 
 func LoadWorker() (WorkerConfig, error) {
@@ -171,6 +189,54 @@ func LoadWorker() (WorkerConfig, error) {
 		return WorkerConfig{}, err
 	}
 	c.AllowPrivate = getEnv("WEBHOOK_ALLOW_PRIVATE", "false") == "true"
+
+	c.PSPBaseURL = getEnv("PSP_BASE_URL", "http://localhost:9090")
+	if c.PSPAttemptTimeout, err = envDuration("PSP_ATTEMPT_TIMEOUT", "2s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.PSPBaseBackoff, err = envDuration("PSP_BASE_BACKOFF", "100ms"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.PSPMaxBackoff, err = envDuration("PSP_MAX_BACKOFF", "1s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.PSPMaxAttempts, err = envInt("PSP_MAX_ATTEMPTS", 3, 1, 10); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.UnknownGrace, err = envDuration("UNKNOWN_GRACE", "2m"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.ReconcileInterval, err = envDuration("RECONCILE_INTERVAL", "30s"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.ReconcileStaleAfter, err = envDuration("RECONCILE_STALE_AFTER", "1m"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.ReconcilePageSize, err = envInt("RECONCILE_PAGE_SIZE", 100, 1, 1000); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.ReconcileMaxErrors, err = envInt("RECONCILE_MAX_CONSECUTIVE_ERRORS", 5, 1, 100); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.RetentionInterval, err = envDuration("RETENTION_INTERVAL", "1h"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.RetentionBatch, err = envInt("RETENTION_BATCH", 1000, 1, 100000); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.IdempotencyRetention, err = envDuration("IDEMPOTENCY_RETENTION", "24h"); err != nil {
+		return WorkerConfig{}, err
+	}
+	if c.OutboxRetention, err = envDuration("OUTBOX_RETENTION", "168h"); err != nil {
+		return WorkerConfig{}, err
+	}
+
+	// Uma requisição viva pode demorar até tentativas x timeout no PSP. Reconciliar antes disso
+	// atropelaria uma requisição que ainda vai gravar o próprio desfecho.
+	if worst := time.Duration(c.PSPMaxAttempts) * c.PSPAttemptTimeout; c.ReconcileStaleAfter <= worst {
+		return WorkerConfig{}, fmt.Errorf("RECONCILE_STALE_AFTER (%s) deve ser maior que PSP_MAX_ATTEMPTS x PSP_ATTEMPT_TIMEOUT (%s)",
+			c.ReconcileStaleAfter, worst)
+	}
 
 	// Se o lease fosse menor que o timeout, outro worker reassumiria uma entrega AINDA em curso.
 	if c.Lease <= c.DeliveryTimeout {

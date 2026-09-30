@@ -323,3 +323,43 @@ func TestOutbox_Claim_PassesStraightThroughRowsLockedByAnotherTransaction(t *tes
 		t.Fatalf("rest=%v err=%v", ids(rest), err)
 	}
 }
+
+func TestOutbox_Purge_OnlyDeletesOldDeliveredOrSkipped(t *testing.T) {
+	e := setup(t)
+	e.addEvents(t, "old-delivered", "old-skipped", "old-dead", "old-pending", "new-delivered")
+	for id, status := range map[string]string{
+		"old-delivered": "delivered", "old-skipped": "skipped", "old-dead": "dead", "new-delivered": "delivered",
+	} {
+		if _, err := e.pool.Exec(e.ctx, `UPDATE outbox_events SET status = $2,
+			delivered_at = CASE WHEN $2 = 'delivered' THEN now() END WHERE event_id = $1`, id, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE outbox_events
+		   SET created_at = CASE WHEN event_id = 'new-delivered' THEN now() ELSE now() - interval '10 days' END`); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := e.outbox().Purge(e.ctx, 7*24*time.Hour, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("apagou %d, want 2 (old-delivered e old-skipped)", n)
+	}
+	for _, keep := range []string{"old-dead", "old-pending", "new-delivered"} {
+		e.eventState(t, keep) // falha o teste se a linha sumiu
+	}
+}
+
+func TestOutbox_Purge_RespectsTheBatchLimit(t *testing.T) {
+	e := setup(t)
+	e.addEvents(t, "a", "b", "c")
+	if _, err := e.pool.Exec(e.ctx, `UPDATE outbox_events SET status = 'skipped', created_at = now() - interval '10 days'`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := e.outbox().Purge(e.ctx, time.Hour, 2)
+	if err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v, want 2", n, err)
+	}
+}

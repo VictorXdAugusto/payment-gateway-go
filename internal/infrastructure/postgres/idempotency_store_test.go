@@ -269,7 +269,7 @@ func TestIdempotencyStore_Purge_OnlyRemovesOldFinishedKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := store.PurgeOlderThan(e.ctx, 24*time.Hour)
+	n, err := store.Purge(e.ctx, 24*time.Hour, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
