@@ -67,11 +67,21 @@ services:
       UNKNOWN_GRACE: "${UNKNOWN_GRACE:-20s}"      # curto para o desenvolvimento; em produção, minutos
       RECONCILE_INTERVAL: "5s"
       RECONCILE_STALE_AFTER: "10s"
+      METRICS_PORT: "9103"
+    # Porta de operação (/metrics, /health, /ready). Publicada só para o desenvolvimento;
+    # em produção ela fica numa rede interna, nunca exposta à internet.
+    ports:
+      - "${WORKER_METRICS_HOST_PORT:-9103}:9103"
     depends_on:
       migrate:
         condition: service_completed_successfully
       psp:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9103/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   # Receptor de webhooks de REFERÊNCIA (só desenvolvimento): verifica a assinatura, deduplica
@@ -97,8 +107,10 @@ services:
       PSP_ATTEMPT_TIMEOUT: "1s"   # menor que o PSP_SLOW do simulador, para exercitar o timeout
       PSP_MAX_ATTEMPTS: "3"
       PLATFORM_FEE_BPS: "290"
+      METRICS_PORT: "9102"
     ports:
       - "${APP_HOST_PORT}:8080"
+      - "${METRICS_HOST_PORT:-9102}:9102"   # só desenvolvimento: métricas não são públicas
     depends_on:
       migrate:
         condition: service_completed_successfully
