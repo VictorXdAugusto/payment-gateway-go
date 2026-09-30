@@ -205,7 +205,7 @@ func TestPaymentRepository_ListStuck_OnlyStuckAndOldEnough(t *testing.T) {
 	e.insertAt(t, "pay_d", "authorized", old) // não está preso
 	e.insertAt(t, "pay_e", "failed", old)     // terminal
 
-	got, err := e.payments().ListStuck(e.ctx, now.Add(-time.Minute), "", 10)
+	got, err := e.payments().ListStuck(e.ctx, now.Add(-time.Minute), "", 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestPaymentRepository_ListStuck_PaginatesWithACursor(t *testing.T) {
 	var all []payment.ID
 	var after payment.ID
 	for pages := 0; pages < 10; pages++ {
-		page, err := e.payments().ListStuck(e.ctx, now, after, 2)
+		page, err := e.payments().ListStuck(e.ctx, now, after, 2, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -235,5 +235,37 @@ func TestPaymentRepository_ListStuck_PaginatesWithACursor(t *testing.T) {
 	}
 	if len(all) != 5 || all[0] != "pay_1" || all[4] != "pay_5" {
 		t.Fatalf("paginação = %v, want pay_1..pay_5 sem repetir nem pular", all)
+	}
+}
+
+// Requisição viva (chave travada dentro do lease) é dona do pagamento: o reconciliador não mexe.
+// Sem este filtro, um retry que retomou um pagamento antigo em created seria atropelado por um
+// "o PSP nunca recebeu" enquanto a chamada ao PSP ainda está a caminho.
+func TestPaymentRepository_ListStuck_SkipsPaymentsWithALiveRequest(t *testing.T) {
+	e := setup(t)
+	old := now.Add(-time.Hour)
+	e.insertAt(t, "pay_live", "created", old)
+	e.insertAt(t, "pay_dead", "created", old)
+	e.insertAt(t, "pay_nokey", "created", old)
+	for key, lock := range map[string]string{
+		"k-pay_live": "now()",                     // requisição em andamento agora
+		"k-pay_dead": "now() - interval '1 hour'", // lease vencido: o processo morreu
+	} {
+		if _, err := e.pool.Exec(e.ctx, `INSERT INTO idempotency_keys (merchant_id, key, request_hash, recovery_point, locked_at)
+			VALUES ($1::uuid, $2, 'h', 'payment_created', `+lock+`)`, e.merchant, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := e.payments().ListStuck(e.ctx, now, "", 10, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "pay_dead" || got[1] != "pay_nokey" {
+		t.Fatalf("ListStuck = %v, want [pay_dead pay_nokey] (pay_live tem requisição viva)", got)
+	}
+	// Com o filtro desligado, todos aparecem.
+	if all, _ := e.payments().ListStuck(e.ctx, now, "", 10, 0); len(all) != 3 {
+		t.Errorf("sem filtro = %v, want 3", all)
 	}
 }

@@ -123,12 +123,19 @@ func (r *PaymentRepository) Update(ctx context.Context, p *payment.Payment) erro
 
 // ListStuck usa o índice parcial payments_stuck_idx: só pagamentos created/unknown entram nele,
 // então a varredura custa proporcional ao que está preso, não ao total de pagamentos.
-func (r *PaymentRepository) ListStuck(ctx context.Context, before time.Time, afterID payment.ID, limit int) ([]payment.ID, error) {
+// O relógio do lease é o do banco, o mesmo que a chave de idempotência usa.
+func (r *PaymentRepository) ListStuck(ctx context.Context, before time.Time, afterID payment.ID, limit int,
+	leaseWindow time.Duration) ([]payment.ID, error) {
 	rows, err := r.tx.DB(ctx).Query(ctx, `
-		SELECT id FROM payments
-		 WHERE status IN ('created', 'unknown') AND updated_at < $1 AND id > $2
-		 ORDER BY id
-		 LIMIT $3`, before, string(afterID), limit)
+		SELECT p.id FROM payments p
+		 WHERE p.status IN ('created', 'unknown') AND p.updated_at < $1 AND p.id > $2
+		   AND NOT EXISTS (
+		       SELECT 1 FROM idempotency_keys k
+		        WHERE k.merchant_id = p.merchant_id AND k.key = p.idempotency_key
+		          AND k.locked_at IS NOT NULL
+		          AND k.locked_at > now() - make_interval(secs => $4::float8))
+		 ORDER BY p.id
+		 LIMIT $3`, before, string(afterID), limit, leaseWindow.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("listar pagamentos presos: %w", err)
 	}

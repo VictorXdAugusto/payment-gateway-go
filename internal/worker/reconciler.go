@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/VictorXdAugusto/payment-gateway-go/internal/domain/payment"
@@ -10,7 +11,7 @@ import (
 
 // StuckLister enumera pagamentos presos. Implementado pelo repositório de pagamentos.
 type StuckLister interface {
-	ListStuck(ctx context.Context, before time.Time, afterID payment.ID, limit int) ([]payment.ID, error)
+	ListStuck(ctx context.Context, before time.Time, afterID payment.ID, limit int, leaseWindow time.Duration) ([]payment.ID, error)
 }
 
 // Resolver tenta resolver UM pagamento preso e devolve o status depois da tentativa.
@@ -21,7 +22,10 @@ type Resolver interface {
 type ReconcilerConfig struct {
 	Interval   time.Duration // pausa entre varreduras
 	StaleAfter time.Duration // só mexe em pagamento parado há mais que isso (não atropela requisição viva)
-	PageSize   int           // quantos ids por consulta
+	// IdempotencyLease: pagamentos cuja chave de idempotência está travada há menos que isso têm
+	// uma requisição viva e são pulados. Deve ser o mesmo IDEMPOTENCY_LEASE do servidor.
+	IdempotencyLease time.Duration
+	PageSize         int // quantos ids por consulta
 	// MaxConsecutiveErrors interrompe a varredura quando o PSP parece fora do ar: insistir só
 	// gera carga num serviço doente. A próxima varredura tenta de novo.
 	MaxConsecutiveErrors int
@@ -44,6 +48,8 @@ type Report struct {
 // Reconciler varre periodicamente os pagamentos presos e pede ao caso de uso que os resolva.
 // É o que fecha o ciclo do estado unknown: sem ele, um timeout no PSP viraria pendência eterna.
 type Reconciler struct {
+	mu       sync.Mutex
+	resume   payment.ID // onde a próxima varredura recomeça depois de uma varredura abortada
 	payments StuckLister
 	resolve  Resolver
 	cfg      ReconcilerConfig
@@ -97,14 +103,20 @@ func (r *Reconciler) result(res string) {
 }
 
 func (r *Reconciler) sweep(ctx context.Context) (Report, error) {
+	// Uma varredura por vez. O ponto de retomada evita a fome: se os primeiros pagamentos da fila
+	// falham SEMPRE (dado corrompido, por exemplo) e abortam a varredura, a próxima recomeça depois
+	// deles em vez de bater nos mesmos de novo e nunca chegar aos demais.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var (
 		rep         Report
-		after       payment.ID
+		after       = r.resume
 		consecutive int
 		cutoff      = r.now().Add(-r.cfg.StaleAfter)
 	)
+	r.resume = ""
 	for ctx.Err() == nil {
-		ids, err := r.payments.ListStuck(ctx, cutoff, after, r.cfg.PageSize)
+		ids, err := r.payments.ListStuck(ctx, cutoff, after, r.cfg.PageSize, r.cfg.IdempotencyLease)
 		if err != nil {
 			return rep, err
 		}
@@ -122,6 +134,7 @@ func (r *Reconciler) sweep(ctx context.Context) (Report, error) {
 				r.log.Warn("não foi possível reconciliar o pagamento", "payment_id", id, "error", err)
 				if consecutive >= r.cfg.MaxConsecutiveErrors {
 					rep.Aborted = true
+					r.resume = id // a próxima varredura continua DEPOIS deste
 					return rep, nil
 				}
 			case err != nil:

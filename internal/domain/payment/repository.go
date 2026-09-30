@@ -25,8 +25,11 @@ type Repository interface {
 
 	// ListStuck devolve, em ordem de id, até limit pagamentos presos (created ou unknown) cuja
 	// última mudança é anterior a before e cujo id é maior que afterID (paginação por cursor:
-	// "" começa do início). Uso INTERNO (reconciliação).
-	ListStuck(ctx context.Context, before time.Time, afterID ID, limit int) ([]ID, error)
+	// "" começa do início). Pagamentos cuja chave de idempotência está travada há menos de
+	// leaseWindow têm uma requisição VIVA processando e são pulados (0 desliga o filtro): sem
+	// isso, o reconciliador poderia declarar "o PSP nunca recebeu" enquanto a requisição que
+	// retomou o pagamento ainda está a caminho do PSP. Uso INTERNO (reconciliação).
+	ListStuck(ctx context.Context, before time.Time, afterID ID, limit int, leaseWindow time.Duration) ([]ID, error)
 
 	// Update grava as mudanças com lock otimista: só vale se a versão no banco ainda for a
 	// que o agregado tinha quando foi carregado. Senão, ErrConcurrentModification.

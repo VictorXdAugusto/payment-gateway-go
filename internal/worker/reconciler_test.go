@@ -15,13 +15,17 @@ type fakeLister struct {
 	mu      sync.Mutex
 	ids     []payment.ID // ordenados
 	cutoffs []time.Time
+	leases  []time.Duration
+	afters  []payment.ID
 	err     error
 }
 
-func (f *fakeLister) ListStuck(_ context.Context, before time.Time, after payment.ID, limit int) ([]payment.ID, error) {
+func (f *fakeLister) ListStuck(_ context.Context, before time.Time, after payment.ID, limit int, lease time.Duration) ([]payment.ID, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cutoffs = append(f.cutoffs, before)
+	f.afters = append(f.afters, after)
+	f.leases = append(f.leases, lease)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -188,5 +192,44 @@ func TestReconciler_StillPendingCountsAsAHealthyAnswer(t *testing.T) {
 	rep, err := rec.RunOnce(context.Background())
 	if err != nil || rep.Aborted || rep.Examined != 3 {
 		t.Errorf("report = %+v err=%v, want 3 examinados sem abortar", rep, err)
+	}
+}
+
+// A varredura repassa o lease da chave para o repositório (pagamentos com requisição viva ficam de fora).
+func TestReconciler_PassesTheIdempotencyLeaseToTheRepository(t *testing.T) {
+	l := &fakeLister{ids: []payment.ID{"p1"}}
+	rec := newRecon(l, &fakeResolver{}, worker.ReconcilerConfig{StaleAfter: time.Minute, PageSize: 10,
+		MaxConsecutiveErrors: 1, IdempotencyLease: 45 * time.Second})
+	if _, err := rec.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if l.leases[0] != 45*time.Second {
+		t.Errorf("lease = %v, want 45s", l.leases[0])
+	}
+}
+
+// Os primeiros da fila falham SEMPRE e abortam a varredura: sem o ponto de retomada, toda
+// varredura bateria nos mesmos e os demais pagamentos nunca seriam reconciliados.
+func TestReconciler_AfterAnAbortedSweep_TheNextOneResumesPastThePoisonedPayments(t *testing.T) {
+	l := &fakeLister{ids: []payment.ID{"p1", "p2", "p3", "p4", "p5"}}
+	poison := errors.New("dado corrompido")
+	r := &fakeResolver{errs: map[payment.ID]error{"p1": poison, "p2": poison, "p3": poison}}
+	rec := newRecon(l, r, worker.ReconcilerConfig{StaleAfter: time.Minute, PageSize: 10, MaxConsecutiveErrors: 3})
+
+	first, _ := rec.RunOnce(context.Background())
+	if !first.Aborted || len(r.calls) != 3 {
+		t.Fatalf("1ª varredura: %+v calls=%v, want abortada em p3", first, r.calls)
+	}
+	second, err := rec.RunOnce(context.Background())
+	if err != nil || second.Aborted || second.Resolved != 2 {
+		t.Fatalf("2ª varredura: %+v err=%v, want p4 e p5 resolvidos", second, err)
+	}
+	if l.afters[1] != "p3" {
+		t.Errorf("a 2ª varredura começou depois de %q, want p3", l.afters[1])
+	}
+
+	// Terminou sem abortar: a 3ª volta ao início (os envenenados têm nova chance).
+	if _, _ = rec.RunOnce(context.Background()); l.afters[len(l.afters)-1] != "" {
+		t.Errorf("depois de uma varredura completa o cursor deve voltar ao início, foi %q", l.afters[len(l.afters)-1])
 	}
 }
