@@ -1,12 +1,30 @@
 # payment-gateway-go
 
-Um gateway de pagamentos em Go (estilo mini-Stripe), construído para demonstrar como tratar
-dinheiro quando a rede falha: **idempotência, máquina de estados, ledger de partida dobrada,
-chamada ao adquirente fora da transação, outbox transacional, webhooks assinados e reconciliação**.
+Gateway de pagamentos em Go, no estilo de um mini-Stripe: autorização, captura, cancelamento,
+estorno, saldo e extrato do lojista, com entrega de webhooks.
+
+## Objetivo
+
+É um case de estudo sobre como tratar dinheiro quando a rede falha. O caminho feliz de um
+pagamento é simples. O difícil é o que acontece quando o cliente repete uma requisição que deu
+timeout, quando o processo cai depois de cobrar no adquirente ou quando o adquirente não responde.
+O projeto existe para resolver esses casos sem cobrar duas vezes, sem perder cobrança e sem deixar
+o saldo errado.
+
+As técnicas aplicadas são **idempotência, máquina de estados, ledger de partida dobrada, chamada
+ao adquirente fora da transação, outbox transacional, webhooks assinados e reconciliação**.
 
 O adquirente (PSP) é um simulador que roda como serviço HTTP real e falha de propósito
 (timeout, 503, aprovação perdida), para que cada garantia abaixo seja provada por teste,
 não só afirmada.
+
+Não é um produto pronto para produção. O que ficou de fora está em
+[Limitações conhecidas](#limitações-conhecidas).
+
+## Stack
+
+Go 1.27 com a biblioteca padrão no HTTP (`net/http`, `log/slog`), sem framework web. `pgx/v5`,
+PostgreSQL 17, migrations SQL com golang-migrate, métricas com Prometheus e Docker Compose.
 
 ## O que garante
 
@@ -46,13 +64,13 @@ Toda composição acontece em `cmd/*/main.go`.
 ### Fluxo de uma captura
 
 ```
-cliente ──POST /v1/payments/{id}/capture──▶ API
+cliente -> POST /v1/payments/{id}/capture -> API
   1. adquire a Idempotency-Key (INSERT ... ON CONFLICT)
   2. valida a transição authorized -> captured
   3. chama o PSP (fora de transação, idempotente por "capture:<id>")
   4. UMA transação grava: pagamento + lançamentos do ledger + evento na outbox + chave finalizada
   5. responde 200 (a resposta fica guardada: o retry devolve a mesma)
-worker ──lê a outbox──▶ POST assinado (HMAC-SHA256) no webhook do lojista
+worker -> lê a outbox -> POST assinado (HMAC-SHA256) no webhook do lojista
 ```
 
 Se o processo cair entre 3 e 4, o retry repete o passo 3 (o PSP devolve o mesmo resultado) e conclui.
