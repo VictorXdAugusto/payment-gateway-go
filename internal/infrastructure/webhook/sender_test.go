@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,6 +56,22 @@ func TestIsPublicIP(t *testing.T) {
 		{"198.18.0.1", false},
 		{"172.32.0.1", true}, // logo fora da faixa privada 172.16/12
 		{"100.128.0.1", true},
+
+		// faixas especiais adicionais
+		{"fec0::1", false},             // site-local
+		{"feff:ffff::1", false},        // fim do fec0::/10
+		{"2002:c0a8:101::1", false},    // 6to4 embutindo 192.168.1.1
+		{"2001::1", false},             // Teredo
+		{"2001:db8::1", false},         // documentação IPv6
+		{"192.0.2.1", false},           // TEST-NET-1
+		{"198.51.100.1", false},        // TEST-NET-2
+		{"203.0.113.1", false},         // TEST-NET-3
+		{"100::1", false},              // discard-only
+		{"192.88.99.1", false},         // 6to4 relay
+		{"2001:4860:4860::8888", true}, // fora de 2001::/32 e 2001:db8::/32
+		{"2003::1", true},              // logo fora de 2002::/16
+		{"192.0.3.1", true},            // logo fora de 192.0.2.0/24
+		{"203.0.114.1", true},          // logo fora de 203.0.113.0/24
 	}
 	for _, tt := range tests {
 		t.Run(tt.ip, func(t *testing.T) {
@@ -207,5 +225,87 @@ func TestDeliver_RejectsUnsafeURLs(t *testing.T) {
 				t.Errorf("err = %v, want ErrPermanent", err)
 			}
 		})
+	}
+}
+
+func TestDeliver_EmptySecret_IsPermanentAndSendsNothing(t *testing.T) {
+	var hit atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hit.Add(1) }))
+	defer srv.Close()
+
+	d := delivery(srv.URL)
+	d.Secret = ""
+	err := devSender().Deliver(context.Background(), d)
+	if !errors.Is(err, outbox.ErrPermanent) {
+		t.Fatalf("err = %v, want ErrPermanent", err)
+	}
+	if hit.Load() != 0 {
+		t.Error("o webhook sem segredo foi enviado, assinado com chave vazia")
+	}
+}
+
+// Timeout zero não pode virar "sem limite": o sender aplica o padrão.
+func TestNewSender_ZeroTimeout_UsesDefault(t *testing.T) {
+	defer infra.SetDefaultTimeout(200 * time.Millisecond)()
+
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release) // roda antes de srv.Close e libera o handler
+
+	// O prazo do chamador é só rede de segurança: se o sender não aplicar o próprio limite, o erro
+	// será deste contexto.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := infra.NewSender(infra.Config{AllowPrivate: true}).Deliver(ctx, delivery(srv.URL))
+	if err == nil {
+		t.Fatal("err = nil, want timeout")
+	}
+	if ctx.Err() != nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("o sender não aplicou o timeout padrão (levou %v): %v", time.Since(start), err)
+	}
+}
+
+// A URL do webhook pode carregar token na query string: não pode vazar no erro.
+func TestDeliver_TransportError_DoesNotLeakURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL + "/cb?token=segredo"
+	srv.Close() // porta fechada: conexão recusada
+
+	err := devSender().Deliver(context.Background(), delivery(url))
+	if err == nil {
+		t.Fatal("err = nil, want falha de conexão")
+	}
+	if strings.Contains(err.Error(), "segredo") || strings.Contains(err.Error(), "token") {
+		t.Errorf("o erro vaza a URL: %v", err)
+	}
+	if errors.Is(err, outbox.ErrPermanent) {
+		t.Errorf("falha de conexão é retentável: %v", err)
+	}
+}
+
+// Sem a URL na mensagem, a causa continua acessível para errors.Is/As.
+func TestDeliver_TransportError_PreservesCause(t *testing.T) {
+	prod := infra.NewSender(infra.Config{Timeout: time.Second})
+	err := prod.Deliver(context.Background(), delivery("https://127.0.0.1:9/cb?token=segredo"))
+	if !errors.Is(err, infra.ErrBlockedDestination) {
+		t.Errorf("err = %v, want ErrBlockedDestination", err)
+	}
+	if strings.Contains(err.Error(), "segredo") {
+		t.Errorf("o erro vaza a URL: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Sem drenar o corpo o servidor não percebe o cliente desistir e o contexto nunca encerra.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	err = devSender().Deliver(context.Background(), delivery(srv.URL+"?token=segredo"))
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Errorf("err = %v, want net.Error com Timeout()", err)
 	}
 }

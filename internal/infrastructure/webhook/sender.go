@@ -31,8 +31,13 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("endpoint respondeu %d: %s", e.Code, e.Snippet)
 }
 
+// defaultTimeout é o limite de uma entrega quando Config.Timeout não é positivo. Timeout zero no
+// http.Client significa "sem limite": um endpoint que aceita a conexão e nunca responde prenderia
+// a entrega para sempre. Variável (e não constante) só para o teste encurtá-lo.
+var defaultTimeout = 10 * time.Second
+
 type Config struct {
-	Timeout time.Duration // limite total de UMA entrega
+	Timeout time.Duration // limite total de UMA entrega; <= 0 usa o padrão de 10s
 	// AllowPrivate desliga a proteção contra SSRF e o exigir-HTTPS. SÓ para desenvolvimento
 	// e testes (o receptor de exemplo roda numa rede privada do Docker).
 	AllowPrivate bool
@@ -45,6 +50,9 @@ type Sender struct {
 }
 
 func NewSender(cfg Config) *Sender {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
 	dialer := &net.Dialer{
 		Timeout: 3 * time.Second,
 		// Control roda DEPOIS da resolução de DNS, com o IP real que vai ser conectado. Checar
@@ -88,6 +96,11 @@ func NewSender(cfg Config) *Sender {
 // A assinatura é gerada AGORA (não na criação do evento): tentativas horas depois continuam
 // dentro da tolerância de timestamp do receptor.
 func (s *Sender) Deliver(ctx context.Context, d outbox.Delivery) error {
+	// Segredo vazio assinaria com chave HMAC vazia, reproduzível por qualquer um que conheça o
+	// endpoint: um atacante forjaria eventos de pagamento. Nada é enviado.
+	if d.Secret == "" {
+		return fmt.Errorf("%w: segredo do webhook não configurado", outbox.ErrPermanent)
+	}
 	if err := s.validateURL(d.WebhookURL); err != nil {
 		return fmt.Errorf("%w: %v", outbox.ErrPermanent, err)
 	}
@@ -103,8 +116,14 @@ func (s *Sender) Deliver(ctx context.Context, d outbox.Delivery) error {
 
 	res, err := s.client.Do(req)
 	if err != nil {
+		// *url.Error carrega a URL completa, que pode ter token na query string, e o erro vai para
+		// log e outbox_events.last_error. Mantém só a operação e a causa (errors.Is/As seguem valendo).
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
+		}
 		if errors.Is(err, ErrBlockedDestination) {
-			return fmt.Errorf("%w: %v", outbox.ErrPermanent, err)
+			return fmt.Errorf("%w: %w", outbox.ErrPermanent, err)
 		}
 		return err
 	}
@@ -140,12 +159,21 @@ func (s *Sender) validateURL(raw string) error {
 }
 
 var blockedPrefixes = mustPrefixes(
-	"0.0.0.0/8",     // "esta rede"
-	"100.64.0.0/10", // CGNAT
-	"192.0.0.0/24",  // IETF
-	"198.18.0.0/15", // benchmark
-	"240.0.0.0/4",   // reservado
-	"64:ff9b::/96",  // NAT64
+	"0.0.0.0/8",       // "esta rede"
+	"100.64.0.0/10",   // CGNAT
+	"192.0.0.0/24",    // IETF
+	"198.18.0.0/15",   // benchmark
+	"240.0.0.0/4",     // reservado
+	"64:ff9b::/96",    // NAT64
+	"fec0::/10",       // IPv6 site-local (obsoleto)
+	"2002::/16",       // 6to4: pode embutir IPv4 privado
+	"2001::/32",       // Teredo
+	"2001:db8::/32",   // documentação IPv6
+	"192.0.2.0/24",    // documentação IPv4 (TEST-NET-1)
+	"198.51.100.0/24", // documentação IPv4 (TEST-NET-2)
+	"203.0.113.0/24",  // documentação IPv4 (TEST-NET-3)
+	"100::/64",        // discard-only
+	"192.88.99.0/24",  // 6to4 relay anycast (obsoleto)
 )
 
 func mustPrefixes(cidrs ...string) []netip.Prefix {
